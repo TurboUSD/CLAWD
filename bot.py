@@ -371,6 +371,15 @@ def _pick_final_buyer(token_deltas: Dict[str, int], exclude_addrs: List[str]) ->
     return best_addr
 
 
+def _total_outflow(deltas_for_token: Dict[str, int]) -> int:
+    # Sum of all negative deltas (outflows) across all addresses
+    total = 0
+    for _addr, d in (deltas_for_token or {}).items():
+        if d < 0:
+            total += -d
+    return total
+
+
 def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     token_addresses = {
         TOKEN_ADDRESS: TOKEN_DECIMALS,
@@ -381,14 +390,10 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
 
     deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
 
-    tx = _get_tx(tx_hash)
-    tx_from = _norm(tx.get("from", ""))
-
     tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
     if not tdel:
         return None
 
-    # Exclusions for receiver fallback
     exclude = [
         TOKEN_ADDRESS,
         USDC_ADDRESS,
@@ -398,52 +403,46 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         STAKING_CONTRACT_ADDRESS,
     ]
 
-    # Buyer resolution
-    buyer = tx_from if tx_from else _pick_final_buyer(tdel, exclude)
+    # Buyer is whoever has the largest net positive CLAWD delta
+    buyer = _pick_final_buyer(tdel, exclude)
     if not buyer:
         return None
 
-    # Tokens received
     tokens_delta_int = int(tdel.get(buyer, 0))
     if tokens_delta_int <= 0:
-        # Fallback to max receiver of CLAWD
-        buyer2 = _pick_final_buyer(tdel, exclude)
-        if not buyer2:
-            return None
-        buyer = buyer2
-        tokens_delta_int = int(tdel.get(buyer, 0))
-        if tokens_delta_int <= 0:
-            return None
+        return None
 
     tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
 
-    # USD spent by tx.from (payer), not by token receiver
-    payer = tx_from if tx_from else buyer
+    # Compute USD spent without assuming tx.from is payer.
+    # Prefer stablecoin outflow totals (USDC/USDT).
+    usdc_out_total = _total_outflow(deltas.get(_norm(USDC_ADDRESS)) or {})
+    usdt_out_total = _total_outflow(deltas.get(_norm(USDT_ADDRESS)) or {})
 
-    usdc_out = max(0, -(deltas.get(_norm(USDC_ADDRESS)) or {}).get(payer, 0))
-    usdt_out = max(0, -(deltas.get(_norm(USDT_ADDRESS)) or {}).get(payer, 0))
-    weth_out = max(0, -(deltas.get(_norm(WETH_ADDRESS)) or {}).get(payer, 0))
+    spent_usd = _dec(usdc_out_total, 6) + _dec(usdt_out_total, 6)
 
-    eth_value_int = int(tx.get("value", "0x0"), 16)
+    if spent_usd <= 0:
+        # Fallback: use WETH outflow totals + ETH value
+        tx = _get_tx(tx_hash)
+        eth_value_int = int(tx.get("value", "0x0"), 16)
 
-    wp = _weth_price_usd() or 0.0
-    spent_usd = 0.0
-    spent_usd += _dec(usdc_out, 6)
-    spent_usd += _dec(usdt_out, 6)
-    spent_usd += (_dec(weth_out, 18) + _dec(eth_value_int, 18)) * wp
+        weth_out_total = _total_outflow(deltas.get(_norm(WETH_ADDRESS)) or {})
+        wp = _weth_price_usd() or 0.0
 
-    # USD estimated from received tokens
-    price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-    est_usd = (float(price) if price is not None else 0.0) * float(tokens_bought)
+        spent_usd = (_dec(weth_out_total, 18) + _dec(eth_value_int, 18)) * wp
 
-    total_usd = max(spent_usd, est_usd)
+    # Final fallback: estimate from tokens received * token USD price
+    if spent_usd <= 0:
+        price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+        if price is not None and price > 0:
+            spent_usd = float(price) * float(tokens_bought)
 
-    if total_usd <= 0:
+    if spent_usd <= 0:
         return None
 
     return {
         "buyer": buyer,
-        "usd": float(total_usd),
+        "usd": float(spent_usd),
         "tokens": float(tokens_bought),
     }
 
