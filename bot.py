@@ -492,12 +492,16 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         wp = _weth_price_usd() or 0.0
         spent_usd += _dec(max(0, -weth_del.get(payer, 0)), 18) * wp
 
-    # Add ETH value only if tx.value > 0 and tx.from is buyer or payer
+    # Add native ETH value (tx.value) if present. This is the primary payment path for
+    # buys executed with ETH (no stablecoin transfer out).
     try:
         tx = _get_tx(tx_hash)
         tx_from = _norm(tx.get("from", ""))
         eth_value_int = int(tx.get("value", "0x0"), 16)
-        if eth_value_int > 0 and tx_from and (tx_from == buyer or (payer and tx_from == payer)):
+        if eth_value_int > 0:
+            # If we didn't already infer a payer from stable/WETH outflow, assume tx.from paid.
+            if payer is None and tx_from:
+                payer = tx_from
             wp = _weth_price_usd() or 0.0
             spent_usd += _dec(eth_value_int, 18) * wp
     except Exception:
@@ -648,6 +652,10 @@ def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[s
 # =========================
 
 def _classify_transfer_log(log: Dict[str, Any]) -> Optional[Tuple[str, str, str, int]]:
+    # Only classify stake or burn when the Transfer log belongs to the CLAWD token contract
+    if _norm(log.get("address", "")) != _norm(TOKEN_ADDRESS):
+        return None
+
     topics = log.get("topics") or []
     if len(topics) < 3:
         return None
