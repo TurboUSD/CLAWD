@@ -436,8 +436,11 @@ def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
         hour = int(ts) - (int(ts) % 3600)
         frm = max(0, hour - 3600)
         to = hour + 3600
+        # Use Ethereum for ETH/USD history. Base's native coin is ETH, and using
+        # "eth" avoids any chain-specific indexing quirks while keeping the
+        # USD price correct.
         res = _ankr_multichain_rpc("ankr_getTokenPriceHistory", {
-            "blockchain": "base",
+            "blockchain": "eth",
             "fromTimestamp": frm,
             "toTimestamp": to,
             "interval": 3600,
@@ -469,7 +472,9 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
     if ts is not None:
         hour = int(ts) - (int(ts) % 3600)
         cache = _load_eth_price_cache()
-        key = str(hour)
+        # Namespace the cache key so older cached values (from previous logic)
+        # can't poison historical lookups.
+        key = f"eth:{hour}"
         if key in cache and cache[key] > 0:
             return float(cache[key])
 
@@ -478,7 +483,15 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
             cache[key] = float(p)
             # keep cache bounded (last ~60 days hourly)
             if len(cache) > 24 * 60:
-                keys_sorted = sorted(cache.keys(), key=lambda x: int(x))
+                def _k_to_int(k: str) -> int:
+                    try:
+                        if k.startswith("eth:"):
+                            return int(k.split(":", 1)[1])
+                        return int(k)
+                    except Exception:
+                        return 0
+
+                keys_sorted = sorted(cache.keys(), key=_k_to_int)
                 for k in keys_sorted[:-24 * 60]:
                     cache.pop(k, None)
             _save_eth_price_cache(cache)
