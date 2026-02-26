@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import time
+import calendar
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
@@ -22,6 +23,16 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 BASE_RPC_URL = (os.environ.get("BASE_RPC_URL", "").strip() or "https://mainnet.base.org")
 ANKR_MULTICHAIN_RPC_URL = os.environ.get("ANKR_MULTICHAIN_RPC_URL", "").strip()
 
+# If ANKR_MULTICHAIN_RPC_URL is not set, derive it from BASE_RPC_URL when using Ankr endpoints.
+# This lets you configure only BASE_RPC_URL=https://rpc.ankr.com/base/<KEY>.
+if not ANKR_MULTICHAIN_RPC_URL:
+    try:
+        if BASE_RPC_URL.startswith("https://rpc.ankr.com/") and "/base/" in BASE_RPC_URL:
+            ANKR_MULTICHAIN_RPC_URL = BASE_RPC_URL.replace("/base/", "/multichain/").rstrip("/")
+    except Exception:
+        pass
+
+
 # Convenience: if user only set BASE_RPC_URL to Ankr Base endpoint,
 # derive the multichain endpoint automatically using the same key.
 if not ANKR_MULTICHAIN_RPC_URL and "rpc.ankr.com/base/" in (BASE_RPC_URL or ""):
@@ -37,6 +48,7 @@ DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") el
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
 ETH_PRICE_CACHE_PATH = os.environ.get("ETH_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_cache.json"))
 ETH_DAILY_PRICE_CACHE_PATH = os.environ.get("ETH_DAILY_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_daily.json"))
+ETH_DAILY_SERIES_CACHE_PATH = os.environ.get("ETH_DAILY_SERIES_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_daily_series.json"))
 
 # If ALLOWED_CHAT_ID=0, send to ADMIN_ID in private for testing
 if ALLOWED_CHAT_ID == 0:
@@ -432,6 +444,27 @@ def _save_eth_daily_cache(cache: Dict[str, float]) -> None:
     os.replace(tmp, ETH_DAILY_PRICE_CACHE_PATH)
 
 
+def _load_eth_daily_series_cache() -> Dict[str, Any]:
+    _ensure_data_dir()
+    if not os.path.exists(ETH_DAILY_SERIES_CACHE_PATH):
+        return {}
+    try:
+        with open(ETH_DAILY_SERIES_CACHE_PATH, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_eth_daily_series_cache(cache: Dict[str, Any]) -> None:
+    _ensure_data_dir()
+    tmp = ETH_DAILY_SERIES_CACHE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
+    os.replace(tmp, ETH_DAILY_SERIES_CACHE_PATH)
+
+
+
 def _eth_usd_daily(date_utc: str) -> Optional[float]:
     """
     Return an approximate ETH/USD for a given UTC date (YYYY-MM-DD).
@@ -578,7 +611,7 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
         if p is None or p <= 0:
             # Backup: daily (CoinGecko) to reduce rate limit risk.
             date_utc = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
-            p = _eth_usd_daily(date_utc)
+            p = _eth_usd_daily(date_utc, ts_hint=int(ts))
         if p is not None and p > 0:
             cache[key] = float(p)
             # keep cache bounded (last ~60 days hourly)
