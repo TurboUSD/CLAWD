@@ -1414,6 +1414,16 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_task(f"scan:{update.effective_user.id}", asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)))
 
 
+def _get_eth_price_now() -> float:
+    url = "https://api.dexscreener.com/latest/dex/pairs/base/0x4200000000000000000000000000000000000006"
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        return float(data["pair"]["priceUsd"])
+    except Exception:
+        return 0.0
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -1423,17 +1433,23 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state["cache"] = cache
 
     price, fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-    wp = _weth_price_usd()
+
+    # Use live ETH price for stats (WETH USD should never be historical here)
+    wp = _get_eth_price_now()
 
     if price is not None:
         cache["token_price_usd"] = float(price)
     if fdv is not None:
         cache["token_fdv"] = float(fdv)
+    if wp and wp > 0:
+        cache["eth_price_usd_now"] = float(wp)
 
     if price is None:
         price = cache.get("token_price_usd")
     if fdv is None:
         fdv = cache.get("token_fdv")
+    if (not wp) or wp <= 0:
+        wp = float(cache.get("eth_price_usd_now") or 0.0)
 
     _save_state(state)
 
@@ -1449,9 +1465,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     weth_amt = _dec(weth_bal_int, 18)
     burned_amt = _dec(burned_bal_int, TOKEN_DECIMALS)
 
-    clawd_usd = (price or 0.0) * clawd_amt
-    weth_usd = (wp or 0.0) * weth_amt
-    burned_usd = (price or 0.0) * burned_amt
+    clawd_usd = (float(price or 0.0)) * clawd_amt
+    weth_usd = (float(wp or 0.0)) * weth_amt
+    burned_usd = (float(price or 0.0)) * burned_amt
 
     total_value = clawd_usd + weth_usd
 
