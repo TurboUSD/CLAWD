@@ -535,6 +535,73 @@ async def cmd_setemoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"OK. emoji_usd[{kind}] = {state['emoji_usd'][kind]}")
 
 
+async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> None:
+    def _run_scan_sync() -> str:
+        latest = _get_latest_block()
+        end = latest - max(0, WATCH_CONFIRMATIONS)
+        if end < 0:
+            end = 0
+        start = max(0, end - blocks_back + 1)
+
+        logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
+
+        tx_hashes: List[str] = []
+        seen_tx = set()
+        for lg in logs:
+            h = lg.get("transactionHash")
+            if not h or h in seen_tx:
+                continue
+            seen_tx.add(h)
+            tx_hashes.append(h)
+
+        matches: List[Tuple[str, Dict[str, Any]]] = []
+        for h in tx_hashes:
+            try:
+                receipt = _get_receipt(h)
+                buy = _buy_from_receipt(h, receipt)
+                if not buy:
+                    continue
+                if float(buy["usd"]) >= min_usd:
+                    matches.append((h, buy))
+            except Exception:
+                continue
+
+        if not matches:
+            return f"No buys found in last {blocks_back} blocks above {_fmt_usd_compact(min_usd)}"
+
+        matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
+
+        state = _load_state()
+        usd_per_emoji = float(state["emoji_usd"]["buy"])
+
+        lines: List[str] = []
+        lines.append(f"Buys in last {blocks_back} blocks above {_fmt_usd_compact(min_usd)}")
+
+        for h, buy in matches[:20]:
+            usd = float(buy["usd"])
+            tokens = float(buy["tokens"])
+            buyer = buy["buyer"]
+            bar = _emoji_bar(usd, usd_per_emoji)
+
+            lines.append("")
+            lines.append(f"{bar} {_fmt_usd_compact(usd)}")
+            lines.append(f"Buyer: {buyer}")
+            lines.append(f"Tokens: {int(round(tokens)):,} CLAWD")
+            lines.append(f"Tx: https://basescan.org/tx/{h}")
+
+        return "\n".join(lines)
+
+    try:
+        msg = await asyncio.to_thread(_run_scan_sync)
+        await app.bot.send_message(
+            chat_id=user_id,
+            text=msg,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        await app.bot.send_message(chat_id=user_id, text=f"scan failed: {e}")
+
+
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -555,74 +622,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if blocks_back > 5000:
         blocks_back = 5000
 
-    latest = _get_latest_block()
-    end = latest - max(0, WATCH_CONFIRMATIONS)
-    if end < 0:
-        end = 0
-    start = max(0, end - blocks_back + 1)
+    await update.message.reply_text("Scanning. I will DM you the results.")
 
-    try:
-        logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
-    except Exception:
-        await update.message.reply_text("RPC error while scanning logs.")
-        return
-
-    tx_hashes: List[str] = []
-    seen_tx = set()
-    for lg in logs:
-        h = lg.get("transactionHash")
-        if not h or h in seen_tx:
-            continue
-        seen_tx.add(h)
-        tx_hashes.append(h)
-
-    matches: List[Tuple[str, Dict[str, Any]]] = []
-    for h in tx_hashes:
-        try:
-            receipt = _get_receipt(h)
-            buy = _buy_from_receipt(h, receipt)
-            if not buy:
-                continue
-            if float(buy["usd"]) >= min_usd:
-                matches.append((h, buy))
-        except Exception:
-            continue
-
-    if not matches:
-        msg = f"No buys found in last {blocks_back} blocks above {_fmt_usd_compact(min_usd)}"
-        ok = await _dm_user(context.application, update.effective_user.id, msg)
-        if not ok:
-            await update.message.reply_text("I could not DM you. Start a private chat with the bot first.")
-        else:
-            await update.message.reply_text("Sent you a DM.")
-        return
-
-    matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
-
-    state = _load_state()
-    usd_per_emoji = float(state["emoji_usd"]["buy"])
-
-    lines: List[str] = []
-    lines.append(f"Buys in last {blocks_back} blocks above {_fmt_usd_compact(min_usd)}")
-
-    for h, buy in matches[:20]:
-        usd = float(buy["usd"])
-        tokens = float(buy["tokens"])
-        buyer = buy["buyer"]
-        bar = _emoji_bar(usd, usd_per_emoji)
-
-        lines.append("")
-        lines.append(f"{bar} {_fmt_usd_compact(usd)}")
-        lines.append(f"Buyer: {buyer}")
-        lines.append(f"Tokens: {int(round(tokens)):,} CLAWD")
-        lines.append(f"Tx: https://basescan.org/tx/{h}")
-
-    msg = "\n".join(lines)
-    ok = await _dm_user(context.application, update.effective_user.id, msg)
-    if not ok:
-        await update.message.reply_text("I could not DM you. Start a private chat with the bot first.")
-    else:
-        await update.message.reply_text("Sent you a DM.")
+    asyncio.create_task(
+        _scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)
+    )
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -672,11 +676,25 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"{burned_bil:.2f}B CLAWD ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply")
     lines.append("")
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+    try:
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        # Fallback without HTML so you always see something
+        await update.message.reply_text(f"stats send failed: {e}")
+        await update.message.reply_text("\n".join([
+            "CLAWD stats (plain fallback)",
+            f"Current price: {_fmt_price(price) if price is not None else 'N/A'}",
+            f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}",
+            f"My Wallet: {CLAWD_WALLET}",
+            f"{_fmt_big(clawd_amt)} CLAWD ≈ {_fmt_int_usd(clawd_usd)}",
+            f"{_fmt_weth_two(weth_amt)} WETH ≈ {_fmt_int_usd(weth_usd)}",
+            f"Total value: {_fmt_int_usd(total_value)}",
+            f"Burned: {burned_bil:.2f}B CLAWD ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply",
+        ]), disable_web_page_preview=True)
 
 
 # =========================
