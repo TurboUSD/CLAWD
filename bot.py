@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import time
@@ -53,6 +54,11 @@ STAKING_CONTRACT_ADDRESS = os.environ.get("STAKING_CONTRACT_ADDRESS", "").strip(
 USDC_ADDRESS = os.environ.get("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
 USDT_ADDRESS = os.environ.get("USDT_ADDRESS", "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA").strip()
 WETH_ADDRESS = os.environ.get("WETH_ADDRESS", "0x4200000000000000000000000000000000000006").strip()
+# Ignore LP position NFT transfers / ERC-721 noise
+IGNORE_ERC721_CONTRACTS = {
+    "0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F".lower(),
+}
+
 
 CHAINLINK_ETH_USD_FEED = os.environ.get(
     "CHAINLINK_ETH_USD_FEED",
@@ -67,6 +73,18 @@ LOBSTER = "🦞"
 MAX_EMOJIS = 100
 
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+def _receipt_has_ignored_erc721(receipt: Dict[str, Any]) -> bool:
+    """
+    Returns True if the tx receipt includes logs from known ERC-721 contracts
+    we want to ignore completely (eg LP position NFT transfers).
+    """
+    for lg in receipt.get("logs", []) or []:
+        addr = _norm(lg.get("address", ""))
+        if addr in IGNORE_ERC721_CONTRACTS:
+            return True
+    return False
+
+
 
 
 # =========================
@@ -401,6 +419,9 @@ def _max_outflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], 
 
 
 def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if _receipt_has_ignored_erc721(receipt):
+        return None
+
     token_addresses = {
         TOKEN_ADDRESS: TOKEN_DECIMALS,
         USDC_ADDRESS: 6,
@@ -500,6 +521,125 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         "buyer": buyer,
         "usd": float(total_usd),
         "tokens": float(tokens_bought),
+    }
+
+
+
+def _max_inflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], int]:
+    best_addr = None
+    best_in = 0
+    for addr, d in (deltas_for_token or {}).items():
+        if d > 0 and d > best_in:
+            best_in = d
+            best_addr = addr
+    return best_addr, best_in
+
+
+def _pick_final_seller(token_deltas: Dict[str, int], exclude_addrs: List[str]) -> Optional[str]:
+    exclude = set(_norm(a) for a in exclude_addrs if a)
+    best_addr = None
+    best_out = 0
+    for addr, delta in token_deltas.items():
+        if addr in exclude:
+            continue
+        if delta < 0 and (-delta) > best_out:
+            best_out = -delta
+            best_addr = addr
+    return best_addr
+
+
+def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if _receipt_has_ignored_erc721(receipt):
+        return None
+
+    token_addresses = {
+        TOKEN_ADDRESS: TOKEN_DECIMALS,
+        USDC_ADDRESS: 6,
+        USDT_ADDRESS: 6,
+        WETH_ADDRESS: 18,
+    }
+
+    deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
+    tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
+    if not tdel:
+        return None
+
+    exclude = [
+        TOKEN_ADDRESS,
+        USDC_ADDRESS,
+        USDT_ADDRESS,
+        WETH_ADDRESS,
+        BURN_ADDRESS,
+        STAKING_CONTRACT_ADDRESS,
+    ]
+
+    seller = _pick_final_seller(tdel, exclude)
+    if not seller:
+        return None
+
+    tokens_delta_int = int(tdel.get(seller, 0))
+    if tokens_delta_int >= 0:
+        return None
+
+    tokens_sold = _dec(-tokens_delta_int, TOKEN_DECIMALS)
+
+    # Price estimate for sanity filtering
+    state = _load_state()
+    cache = state.get("cache") or {}
+    state["cache"] = cache
+
+    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    if price is not None:
+        cache["token_price_usd"] = float(price)
+    else:
+        price = cache.get("token_price_usd")
+
+    _save_state(state)
+
+    usd_est = (float(price) if price is not None else 0.0) * float(tokens_sold)
+
+    usdc_del = deltas.get(_norm(USDC_ADDRESS)) or {}
+    usdt_del = deltas.get(_norm(USDT_ADDRESS)) or {}
+    weth_del = deltas.get(_norm(WETH_ADDRESS)) or {}
+
+    recv_usdc, usdc_in = _max_inflow_addr(usdc_del)
+    recv_usdt, usdt_in = _max_inflow_addr(usdt_del)
+    recv_weth, weth_in = _max_inflow_addr(weth_del)
+
+    receiver = None
+    got_usd = 0.0
+
+    # Prefer stablecoin inflow
+    if usdc_in > 0 or usdt_in > 0:
+        receiver = recv_usdc if usdc_in >= usdt_in else recv_usdt
+        if receiver:
+            got_usd += _dec(max(0, usdc_del.get(receiver, 0)), 6)
+            got_usd += _dec(max(0, usdt_del.get(receiver, 0)), 6)
+
+    # Fallback: WETH inflow
+    if got_usd <= 0 and weth_in > 0 and recv_weth:
+        receiver = recv_weth
+        wp = _weth_price_usd() or 0.0
+        got_usd += _dec(max(0, weth_del.get(receiver, 0)), 18) * wp
+
+    # Add ETH received only if tx.to is seller? Hard to do reliably. Skip to avoid false positives.
+
+    if got_usd <= 0:
+        return None
+
+    total_usd = got_usd
+
+    # Coherence filter
+    if usd_est > 0 and got_usd > 0:
+        if got_usd < usd_est * 0.20:
+            return None
+        if got_usd > usd_est * 5.0:
+            return None
+
+    return {
+        "seller": seller,
+        "usd": float(total_usd),
+        "tokens": float(tokens_sold),
     }
 
 
@@ -814,6 +954,50 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
 
+    user_id = update.effective_user.id
+
+    # Mode 1: scan a single transaction hash and, if it's a BUY, send the same buy alert.
+    if len(context.args) == 1:
+        tx_hash = context.args[0].strip()
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+            await update.message.reply_text("Scanning tx hash...")
+            try:
+                receipt = _get_receipt(tx_hash)
+                if not receipt:
+                    await update.message.reply_text("Transaction not found (no receipt).")
+                    return
+            except Exception:
+                await update.message.reply_text("Failed to fetch receipt for this tx.")
+                return
+
+            buy = None
+            try:
+                buy = _buy_from_receipt(tx_hash, receipt)
+            except Exception:
+                buy = None
+
+            if buy:
+                caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]))
+                await _send_photo_or_text(context.application, user_id, "buy", caption)
+                await update.message.reply_text("Buy alert sent in DM.")
+                return
+
+            # Optional: detect if it's a sell, just to report correctly
+            try:
+                sell = _sell_from_receipt(tx_hash, receipt)
+            except Exception:
+                sell = None
+
+            if sell:
+                await update.message.reply_text("That tx looks like a SELL. This command only sends alerts for buys.")
+            else:
+                await update.message.reply_text("That tx is not detected as a buy (no alert sent).")
+            return
+
+        await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>  OR  /scan <tx_hash>")
+        return
+
+    # Mode 2: scan a block range for buys
     if len(context.args) != 2:
         await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>")
         return
