@@ -113,6 +113,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "watch": {
         "last_scanned_block": 0,
         "seen": {"buy": [], "stake": [], "burn": []},
+        "sent": {"buy": [], "stake": [], "burn": []},
     },
     "cache": {
         "token_price_usd": None,
@@ -144,11 +145,16 @@ def _load_state() -> Dict[str, Any]:
             merged["watch"].update(s["watch"])
         if isinstance(s.get("watch", {}).get("seen"), dict):
             merged["watch"]["seen"].update(s["watch"]["seen"])
+        if isinstance(s.get("watch", {}).get("sent"), dict):
+            merged["watch"].setdefault("sent", {"buy": [], "stake": [], "burn": []})
+            merged["watch"]["sent"].update(s["watch"]["sent"])
         if isinstance(s.get("cache"), dict):
             merged["cache"].update(s["cache"])
 
         for k in ("buy", "stake", "burn"):
             merged["watch"]["seen"][k] = list(merged["watch"]["seen"].get(k) or [])
+            merged["watch"].setdefault("sent", {}).setdefault(k, [])
+            merged["watch"]["sent"][k] = list(merged["watch"]["sent"].get(k) or [])
 
         return merged
     except Exception:
@@ -349,10 +355,57 @@ def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional
         return None, None
 
 
+
+def _get_block_timestamp(block_number: int) -> Optional[int]:
+    try:
+        blk = _rpc("eth_getBlockByNumber", [hex(block_number), False])
+        ts_hex = blk.get("timestamp")
+        if isinstance(ts_hex, str) and ts_hex.startswith("0x"):
+            return int(ts_hex, 16)
+    except Exception:
+        return None
+    return None
+
+
+def _coingecko_eth_usd_at_ts(ts: int) -> Optional[float]:
+    """Fetch ETH/USD close to the given unix timestamp using CoinGecko market_chart/range."""
+    try:
+        # Query a small window around the timestamp to get a nearby sample.
+        frm = max(0, int(ts) - 600)
+        to = int(ts) + 600
+        url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range"
+        params = {"vs_currency": "usd", "from": str(frm), "to": str(to)}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, params=params, headers=headers, timeout=25)
+        r.raise_for_status()
+        j = r.json()
+        prices = j.get("prices") or []
+        if not prices:
+            return None
+        # prices: [[ms, price], ...]
+        target_ms = int(ts) * 1000
+        best = min(prices, key=lambda it: abs(int(it[0]) - target_ms))
+        return float(best[1])
+    except Exception:
+        return None
+
+
+
 def _weth_price_usd(block_number: Optional[int] = None) -> Optional[float]:
+    # 1) Best effort: Chainlink read at the tx block (requires an archive-capable RPC).
     v = _chainlink_latest_answer(CHAINLINK_ETH_USD_FEED, block_number=block_number)
     if v is not None and v > 0:
         return float(v)
+
+    # 2) If historic Chainlink read fails, fall back to a timestamp-based historical price.
+    if block_number is not None:
+        ts = _get_block_timestamp(block_number)
+        if ts is not None:
+            vts = _coingecko_eth_usd_at_ts(ts)
+            if vts is not None and vts > 0:
+                return float(vts)
+
+    # 3) Last resort: current-ish price from DexScreener (not historical).
     try:
         p = _dex_best_pair(WETH_ADDRESS)
         if not p:
@@ -488,6 +541,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
 
     payer = None
     spent_usd = 0.0
+    eth_spent_total = 0.0
 
     # Prefer stablecoin payer
     if usdc_out > 0 or usdt_out > 0:
@@ -501,6 +555,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         payer = payer_weth
         wp = _weth_price_usd(block_number=block_number) or 0.0
         spent_usd += _dec(max(0, -weth_del.get(payer, 0)), 18) * wp
+        eth_spent_total += _dec(max(0, -weth_del.get(payer, 0)), 18)
 
     # Add native ETH value (tx.value) if present. This is the primary payment path for
     # buys executed with ETH (no stablecoin transfer out).
@@ -514,6 +569,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
                 payer = tx_from
             wp = _weth_price_usd(block_number=block_number) or 0.0
             spent_usd += _dec(eth_value_int, 18) * wp
+            eth_spent_total += _dec(eth_value_int, 18)
     except Exception:
         pass
 
@@ -535,6 +591,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         "buyer": buyer,
         "usd": float(total_usd),
         "tokens": float(tokens_bought),
+        "eth": float(eth_spent_total),
     }
 
 
@@ -724,7 +781,7 @@ async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> Non
         )
 
 
-def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str) -> str:
+def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str, eth_spent: float = 0.0) -> str:
     state = _load_state()
     usd_per_emoji = float(state["emoji_usd"][kind])
     bar = _emoji_bar(usd, usd_per_emoji)
@@ -734,19 +791,17 @@ def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wa
 
     if kind == "buy":
         title = "CLAWD BOUGHT!"
-        icon = "🦞"
     elif kind == "stake":
         title = "CLAWD STAKED!"
-        icon = "🧊"
     else:
         title = "CLAWD BURNED!"
-        icon = "🔥"
 
     caption = (
         f"<b>{title}</b>\n\n"
         f"{bar}\n\n"
-        f"CLAWD: {_fmt_token_amount(amount_tokens)} ({_fmt_int_usd(usd)}) (<a href=\"{tx_url}\">Tx</a>)\n"
-        f"Wallet: <a href=\"{wallet_url}\">{_short_addr(wallet_addr)}</a>"
+        f'CLAWD: {_fmt_token_amount(amount_tokens)} ({_fmt_int_usd(usd)}) (<a href="{tx_url}">Tx</a>)\n'
+        + (f"ETH: {eth_spent:.2f}\n" if kind == "buy" else "")
+        + f'Wallet: <a href="{wallet_url}">{_short_addr(wallet_addr)}</a>'
     )
     return caption
 
@@ -1004,7 +1059,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 buy = None
 
             if buy:
-                caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]))
+                caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]), float(buy.get("eth", 0.0)))
                 await _send_photo_or_text(context.application, user_id, "buy", caption)
                 await update.message.reply_text("Buy alert sent in DM.")
                 return
@@ -1127,7 +1182,7 @@ def _eid(kind: str, tx_hash: str, log_index_hex: str) -> str:
     return f"{kind}:{tx_hash}:{log_index_hex}"
 
 
-def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
+def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
     state = _load_state()
     latest = _get_latest_block()
     confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
@@ -1182,7 +1237,7 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
                     usd = amount * token_price
                     if usd >= float(state_min["stake"]):
                         caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
-                        outgoing.append(("stake", caption, from_addr))
+                        outgoing.append(("stake", event_id, caption, from_addr))
                     seen_stake.add(event_id)
 
             elif kind == "burn":
@@ -1191,7 +1246,7 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
                     usd = amount * token_price
                     if usd >= float(state_min["burn"]):
                         caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
-                        outgoing.append(("burn", caption, from_addr))
+                        outgoing.append(("burn", event_id, caption, from_addr))
                     seen_burn.add(event_id)
 
         if tx_hash and tx_hash not in tx_seen_local:
@@ -1212,8 +1267,8 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
                 if usd >= float(state_min["buy"]):
                     tokens = float(buy["tokens"])
                     buyer = buy["buyer"]
-                    caption = _event_caption("buy", h, tokens, usd, buyer)
-                    outgoing.append(("buy", caption, buyer))
+                    caption = _event_caption("buy", h, tokens, usd, buyer, float(buy.get("eth", 0.0)))
+                    outgoing.append(("buy", buy_id, caption, buyer))
             seen_buy.add(buy_id)
         except Exception:
             continue
@@ -1231,7 +1286,35 @@ async def monitor(app) -> None:
     while True:
         try:
             outgoing = await asyncio.to_thread(_monitor_tick_sync)
-            for kind, caption, _wallet in outgoing:
+
+            # Dedup at send-time to prevent double alerts (restart, overlap, RPC hiccups)
+            state = _load_state()
+            state.setdefault("watch", {}).setdefault("sent", {"buy": [], "stake": [], "burn": []})
+
+            sent_buy = set(state["watch"]["sent"].get("buy") or [])
+            sent_stake = set(state["watch"]["sent"].get("stake") or [])
+            sent_burn = set(state["watch"]["sent"].get("burn") or [])
+
+            for kind, uid, caption, _wallet in outgoing:
+                if kind == "buy":
+                    if uid in sent_buy:
+                        continue
+                    sent_buy.add(uid)
+                    state["watch"]["sent"]["buy"] = _prune_seen(list(sent_buy))
+                elif kind == "stake":
+                    if uid in sent_stake:
+                        continue
+                    sent_stake.add(uid)
+                    state["watch"]["sent"]["stake"] = _prune_seen(list(sent_stake))
+                elif kind == "burn":
+                    if uid in sent_burn:
+                        continue
+                    sent_burn.add(uid)
+                    state["watch"]["sent"]["burn"] = _prune_seen(list(sent_burn))
+
+                # Persist before sending to avoid duplicates if the process crashes after send
+                _save_state(state)
+
                 await _send_photo_or_text(app, POST_CHAT_ID, kind, caption)
         except Exception:
             pass
