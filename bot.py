@@ -596,7 +596,12 @@ async def cmd_setemoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> None:
-    def _run_scan_sync() -> str:
+    PROGRESS_EVERY = 200  # receipts per progress update
+
+    def _run_scan_sync() -> Dict[str, Any]:
+        import time
+        t0 = time.time()
+
         latest = _get_latest_block()
         end = latest - max(0, WATCH_CONFIRMATIONS)
         if end < 0:
@@ -614,28 +619,53 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             seen_tx.add(h)
             tx_hashes.append(h)
 
-        matches: List[Tuple[str, Dict[str, Any]]] = []
-        for h in tx_hashes:
-            try:
-                receipt = _get_receipt(h)
-                buy = _buy_from_receipt(h, receipt)
-                if not buy:
-                    continue
-                if float(buy["usd"]) >= min_usd:
-                    matches.append((h, buy))
-            except Exception:
-                continue
-
-        if not matches:
-            return f"No buys found in last {blocks_back} blocks above {_fmt_usd_compact(min_usd)}"
-
-        matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
-
         state = _load_state()
         usd_per_emoji = float(state["emoji_usd"]["buy"])
 
+        matches: List[Tuple[str, Dict[str, Any]]] = []
+        receipts_ok = 0
+        receipts_fail = 0
+
+        # We will not send messages from this thread. We will return progress markers to async layer.
+        progress_marks: List[Tuple[int, float]] = []
+
+        for i, h in enumerate(tx_hashes, start=1):
+            try:
+                receipt = _get_receipt(h)
+                receipts_ok += 1
+                buy = _buy_from_receipt(h, receipt)
+                if buy and float(buy["usd"]) >= min_usd:
+                    matches.append((h, buy))
+            except Exception:
+                receipts_fail += 1
+
+            if i % PROGRESS_EVERY == 0:
+                elapsed = time.time() - t0
+                progress_marks.append((i, elapsed))
+
+        matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
+
+        elapsed_total = time.time() - t0
+
+        # Build final text (up to 20 matches)
         lines: List[str] = []
-        lines.append(f"Buys in last {blocks_back} blocks above {_fmt_usd_compact(min_usd)}")
+        lines.append(f"Scan finished")
+        lines.append(f"Blocks: {blocks_back} (from {start} to {end})")
+        lines.append(f"Transfer logs: {len(logs):,}")
+        lines.append(f"Unique txs: {len(tx_hashes):,}")
+        lines.append(f"Receipts ok: {receipts_ok:,}")
+        lines.append(f"Receipts failed: {receipts_fail:,}")
+        lines.append(f"Matches (>= {_fmt_usd_compact(min_usd)}): {len(matches):,}")
+        lines.append(f"Time: {elapsed_total:.1f}s")
+
+        if not matches:
+            return {
+                "final": "\n".join(lines),
+                "progress": progress_marks,
+            }
+
+        lines.append("")
+        lines.append(f"Top results (max 20):")
 
         for h, buy in matches[:20]:
             usd = float(buy["usd"])
@@ -649,15 +679,32 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             lines.append(f"Tokens: {int(round(tokens)):,} CLAWD")
             lines.append(f"Tx: https://basescan.org/tx/{h}")
 
-        return "\n".join(lines)
+        return {
+            "final": "\n".join(lines),
+            "progress": progress_marks,
+        }
 
     try:
-        msg = await asyncio.to_thread(_run_scan_sync)
+        result = await asyncio.to_thread(_run_scan_sync)
+
+        # Send progress updates (best effort)
+        for processed, elapsed in result.get("progress", []):
+            try:
+                await app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"Scan progress: analyzed {processed:,} txs, elapsed {elapsed:.1f}s",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+
+        # Send final report
         await app.bot.send_message(
             chat_id=user_id,
-            text=msg,
+            text=result.get("final", "Scan finished (no output)."),
             disable_web_page_preview=True
         )
+
     except Exception as e:
         await app.bot.send_message(chat_id=user_id, text=f"scan failed: {e}")
 
@@ -674,15 +721,17 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         blocks_back = int(context.args[0])
         min_usd = float(context.args[1])
     except Exception:
-        await update.message.reply_text("Invalid args. Example: /scan 10 10000")
+        await update.message.reply_text("Invalid args. Example: /scan 5000 2000")
         return
 
     if blocks_back < 1:
         blocks_back = 1
-    if blocks_back > 5000:
-        blocks_back = 5000
+    if blocks_back > 20000:
+        blocks_back = 20000
 
-    await update.message.reply_text("Scanning. I will DM you the results.")
+    await update.message.reply_text(
+        f"Scanning last {blocks_back} blocks for buys >= {_fmt_usd_compact(min_usd)}. I will DM you progress and results."
+    )
 
     asyncio.create_task(
         _scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)
