@@ -1414,18 +1414,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_task(f"scan:{update.effective_user.id}", asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)))
 
 
-# Chainlink ETH/USD feed on Base Mainnet
-# Source: https://data.chain.link/feeds/base/base/eth-usd (Standard address on BaseScan)
 CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 
-# If you already have a working Base RPC URL (you do, since balances work), reuse it here.
-# Example:
-# BASE_RPC_URL = "https://rpc.ankr.com/base/<YOUR_ANKR_KEY>"
-# Or just point this to whatever you use in _erc20_balance_of
-BASE_RPC_URL = RPC_URL  # change if your variable name is different
-
-_SEL_DECIMALS = "0x313ce567"         # decimals()
-_SEL_LATEST_ROUND = "0xfeaf968c"     # latestRoundData()
+_SEL_DECIMALS = "0x313ce567"
+_SEL_LATEST_ROUND = "0xfeaf968c"
 
 def _rpc_eth_call(to_addr: str, data_hex: str) -> str:
     payload = {
