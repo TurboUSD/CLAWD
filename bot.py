@@ -658,19 +658,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
 
     lines: List[str] = []
-    lines.append("🔍 $CLAWD Treasury")
-    lines.append("")
+    lines.append("<b>🔍 $CLAWD Treasury</b>")
     lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
     lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
     lines.append("")
-    lines.append("🤖 My Wallet")
+    lines.append("<b>🦞 My Wallet</b>")
     lines.append(wallet_html)
-    lines.append(f"{_fmt_big(clawd_amt)} CLAWD · ≈ {_fmt_int_usd(clawd_usd)}")
-    lines.append(f"{_fmt_weth_two(weth_amt)} WETH · ≈ {_fmt_int_usd(weth_usd)}")
-    lines.append("")
+    lines.append(f"{_fmt_big(clawd_amt)} CLAWD ≈ {_fmt_int_usd(clawd_usd)}")
+    lines.append(f"{_fmt_weth_two(weth_amt)} WETH ≈ {_fmt_int_usd(weth_usd)}")
     lines.append(f"Total value: {_fmt_int_usd(total_value)}")
     lines.append("")
-    lines.append(f"🔥 Burned: {burned_bil:.2f}B CLAWD · ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply")
+    lines.append("<b>🔥 Burned</b>")
+    lines.append(f"{burned_bil:.2f}B CLAWD ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply")
     lines.append("")
 
     await update.message.reply_text(
