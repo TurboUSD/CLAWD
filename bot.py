@@ -33,9 +33,10 @@ WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
 WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
 RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))
 
-DATA_PATH = os.environ.get("DATA_PATH", "/app/data")
+DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else "/app/data")
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
 ETH_PRICE_CACHE_PATH = os.environ.get("ETH_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_cache.json"))
+ETH_DAILY_PRICE_CACHE_PATH = os.environ.get("ETH_DAILY_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_daily.json"))
 
 # If ALLOWED_CHAT_ID=0, send to ADMIN_ID in private for testing
 if ALLOWED_CHAT_ID == 0:
@@ -409,6 +410,66 @@ def _save_eth_price_cache(cache: Dict[str, float]) -> None:
     os.replace(tmp, ETH_PRICE_CACHE_PATH)
 
 
+def _load_eth_daily_cache() -> Dict[str, float]:
+    _ensure_data_dir()
+    if not os.path.exists(ETH_DAILY_PRICE_CACHE_PATH):
+        return {}
+    try:
+        with open(ETH_DAILY_PRICE_CACHE_PATH, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, dict):
+            return {str(k): float(v) for k, v in j.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_eth_daily_cache(cache: Dict[str, float]) -> None:
+    _ensure_data_dir()
+    tmp = ETH_DAILY_PRICE_CACHE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ETH_DAILY_PRICE_CACHE_PATH)
+
+
+def _eth_usd_daily(date_utc: str) -> Optional[float]:
+    """
+    Return an approximate ETH/USD for a given UTC date (YYYY-MM-DD).
+    This is intentionally "daily" to avoid rate limits: at most 1 HTTP call per date, cached on disk.
+    """
+    try:
+        cache = _load_eth_daily_cache()
+        if date_utc in cache and cache[date_utc] > 0:
+            return float(cache[date_utc])
+
+        # CoinGecko daily history endpoint (no Basescan). Cached so it is rarely called.
+        # Date format required: dd-mm-yyyy
+        y, m, d = date_utc.split("-")
+        cg_date = f"{d}-{m}-{y}"
+        url = f"https://api.coingecko.com/api/v3/coins/ethereum/history?date={cg_date}&localization=false"
+        r = requests.get(url, timeout=20, headers={"accept": "application/json"})
+        if r.status_code == 429:
+            return None
+        r.raise_for_status()
+        j = r.json()
+        price = (
+            j.get("market_data", {})
+             .get("current_price", {})
+             .get("usd", None)
+        )
+        if isinstance(price, (int, float)) and price > 0:
+            cache[date_utc] = float(price)
+            # keep cache bounded (last 400 days)
+            if len(cache) > 400:
+                keys_sorted = sorted(cache.keys())
+                for k in keys_sorted[:-400]:
+                    cache.pop(k, None)
+            _save_eth_daily_cache(cache)
+            return float(price)
+    except Exception:
+        return None
+    return None
+
 def _ankr_multichain_rpc(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Call Ankr Advanced API (multichain) JSON-RPC methods like ankr_getTokenPriceHistory.
@@ -513,7 +574,8 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
         if key in cache and cache[key] > 0:
             return float(cache[key])
 
-        p = _eth_usd_from_ankr_history(ts)
+        date_utc = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
+        p = _eth_usd_daily(date_utc)
         if p is not None and p > 0:
             cache[key] = float(p)
             # keep cache bounded (last ~60 days hourly)
@@ -673,20 +735,26 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     payer = None
     spent_usd = 0.0
     eth_spent_total = 0.0
+    usdc_spent = 0.0
+    usdt_spent = 0.0
+    weth_spent = 0.0
+    eth_value_spent = 0.0
 
     # Prefer stablecoin payer
     if usdc_out > 0 or usdt_out > 0:
         payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
         if payer:
-            spent_usd += _dec(max(0, -usdc_del.get(payer, 0)), 6)
-            spent_usd += _dec(max(0, -usdt_del.get(payer, 0)), 6)
+            usdc_spent = _dec(max(0, -usdc_del.get(payer, 0)), 6)
+            usdt_spent = _dec(max(0, -usdt_del.get(payer, 0)), 6)
+            spent_usd += usdc_spent + usdt_spent
 
     # Fallback: WETH payer
     if spent_usd <= 0 and weth_out > 0 and payer_weth:
         payer = payer_weth
         wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
-        spent_usd += _dec(max(0, -weth_del.get(payer, 0)), 18) * wp
-        eth_spent_total += _dec(max(0, -weth_del.get(payer, 0)), 18)
+        weth_spent = _dec(max(0, -weth_del.get(payer, 0)), 18)
+        spent_usd += weth_spent * wp
+        eth_spent_total += weth_spent
 
     # Add native ETH value (tx.value) if present. This is the primary payment path for
     # buys executed with ETH (no stablecoin transfer out).
@@ -699,8 +767,9 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
             if payer is None and tx_from:
                 payer = tx_from
             wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
-            spent_usd += _dec(eth_value_int, 18) * wp
-            eth_spent_total += _dec(eth_value_int, 18)
+            eth_value_spent = _dec(eth_value_int, 18)
+            spent_usd += eth_value_spent * wp
+            eth_spent_total += eth_value_spent
     except Exception:
         pass
 
@@ -723,6 +792,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         "usd": float(total_usd),
         "tokens": float(tokens_bought),
         "eth": float(eth_spent_total),
+        "pay": {"eth": float(eth_spent_total), "usdc": float(usdc_spent), "usdt": float(usdt_spent), "weth": float(weth_spent)},
     }
 
 
@@ -912,7 +982,7 @@ async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> Non
         )
 
 
-def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str, eth_spent: float = 0.0) -> str:
+def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str, pay: Optional[Dict[str, float]] = None) -> str:
     state = _load_state()
     usd_per_emoji = float(state["emoji_usd"][kind])
     bar = _emoji_bar(usd, usd_per_emoji)
@@ -931,7 +1001,7 @@ def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wa
         f"<b>{title}</b>\n\n"
         f"{bar}\n\n"
         f'CLAWD: {_fmt_token_amount(amount_tokens)} ({_fmt_int_usd(usd)}) (<a href="{tx_url}">Tx</a>)\n'
-        + (f"ETH: {eth_spent:.2f}\n" if kind == "buy" else "")
+        + (_payment_line(kind, pay) if kind == "buy" else "")
         + f'Wallet: <a href="{wallet_url}">{_short_addr(wallet_addr)}</a>'
     )
     return caption
@@ -1190,7 +1260,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 buy = None
 
             if buy:
-                caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]), float(buy.get("eth", 0.0)))
+                caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]), pay=buy.get("pay"))
                 await _send_photo_or_text(context.application, user_id, "buy", caption)
                 await update.message.reply_text("Buy alert sent in DM.")
                 return
