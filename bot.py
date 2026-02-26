@@ -22,6 +22,11 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 BASE_RPC_URL = (os.environ.get("BASE_RPC_URL", "").strip() or "https://mainnet.base.org")
 ANKR_MULTICHAIN_RPC_URL = os.environ.get("ANKR_MULTICHAIN_RPC_URL", "").strip()
 
+# Convenience: if user only set BASE_RPC_URL to Ankr Base endpoint,
+# derive the multichain endpoint automatically using the same key.
+if not ANKR_MULTICHAIN_RPC_URL and "rpc.ankr.com/base/" in (BASE_RPC_URL or ""):
+    ANKR_MULTICHAIN_RPC_URL = BASE_RPC_URL.replace("rpc.ankr.com/base/", "rpc.ankr.com/multichain/")
+
 WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "30"))
 WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
 WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
@@ -449,10 +454,13 @@ def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
         return None
 
 
-def _weth_price_usd(block_number: Optional[int] = None) -> Optional[float]:
-    """
-    Historical ETH/USD for a tx. Primary source is Ankr Token API history with local hourly cache.
-    Falls back to DexScreener only if no historical source is available.
+def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: bool = True) -> Optional[float]:
+    """Return ETH/USD.
+
+    Primary: Ankr price history near the tx timestamp with local hourly cache.
+
+    If allow_live_fallback is False, this function will NEVER return a live price.
+    That prevents inflated USD values when historical data is unavailable.
     """
     ts: Optional[int] = None
     if block_number is not None:
@@ -476,25 +484,10 @@ def _weth_price_usd(block_number: Optional[int] = None) -> Optional[float]:
             _save_eth_price_cache(cache)
             return float(p)
 
-    # Last resort: current-ish price from DexScreener (not historical).
-    try:
-        p = _dex_best_pair(WETH_ADDRESS)
-        if not p:
-            return None
-        v2 = p.get("priceUsd")
-        return float(v2) if v2 is not None else None
-    except Exception:
+    if not allow_live_fallback:
         return None
 
-    # 2) If historic Chainlink read fails, fall back to a timestamp-based historical price.
-    if block_number is not None:
-        ts = _get_block_timestamp(block_number)
-        if ts is not None:
-            vts = _coingecko_eth_usd_at_ts(ts)
-            if vts is not None and vts > 0:
-                return float(vts)
-
-    # 3) Last resort: current-ish price from DexScreener (not historical).
+    # Last resort (live): DexScreener. Use only when explicitly allowed.
     try:
         p = _dex_best_pair(WETH_ADDRESS)
         if not p:
@@ -642,7 +635,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     # Fallback: WETH payer
     if spent_usd <= 0 and weth_out > 0 and payer_weth:
         payer = payer_weth
-        wp = _weth_price_usd(block_number=block_number) or 0.0
+        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
         spent_usd += _dec(max(0, -weth_del.get(payer, 0)), 18) * wp
         eth_spent_total += _dec(max(0, -weth_del.get(payer, 0)), 18)
 
@@ -656,7 +649,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
             # If we didn't already infer a payer from stable/WETH outflow, assume tx.from paid.
             if payer is None and tx_from:
                 payer = tx_from
-            wp = _weth_price_usd(block_number=block_number) or 0.0
+            wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
             spent_usd += _dec(eth_value_int, 18) * wp
             eth_spent_total += _dec(eth_value_int, 18)
     except Exception:
@@ -788,7 +781,7 @@ def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[s
     # Fallback: WETH inflow
     if got_usd <= 0 and weth_in > 0 and recv_weth:
         receiver = recv_weth
-        wp = _weth_price_usd(block_number=block_number) or 0.0
+        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
         got_usd += _dec(max(0, weth_del.get(receiver, 0)), 18) * wp
 
     # Add ETH received only if tx.to is seller? Hard to do reliably. Skip to avoid false positives.
