@@ -482,10 +482,12 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     except Exception:
         pass
 
-    total_usd = max(spent_usd, usd_est)
-
-    if total_usd <= 0:
+        # Require real payment outflow. This avoids false positives like LP withdrawals
+    # where the wallet receives both TOKEN and stables in the same tx.
+    if spent_usd <= 0:
         return None
+
+    total_usd = spent_usd
 
     # Coherence filter to kill false positives
     if usd_est > 0 and spent_usd > 0:
@@ -574,7 +576,7 @@ def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wa
         icon = "🔥"
 
     caption = (
-        f"<b>{icon} {title}</b>\n\n"
+        f"<b>{title}</b>\n\n"
         f"{bar}\n\n"
         f"CLAWD: {_fmt_token_amount(amount_tokens)} ({_fmt_int_usd(usd)}) (<a href=\"{tx_url}\">Tx</a>)\n"
         f"Wallet: <a href=\"{wallet_url}\">{_short_addr(wallet_addr)}</a>"
