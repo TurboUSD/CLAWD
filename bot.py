@@ -581,73 +581,94 @@ def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
         return None
 
 
-def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: bool = True) -> Optional[float]:
-    """Return ETH/USD.
 
-    This bot uses ETH/USD mainly to value native-ETH buys.
-    To keep it simple and stable (and avoid "historical state" issues on non-archive RPC),
-    we base the price on timestamp (hourly/daily), not on per-block Chainlink reads.
+# Chainlink ETH/USD feed on Base Mainnet (proxy)
+# Source: https://data.chain.link/feeds/base/base/eth-usd
+CHAINLINK_ETH_USD_FEED_BASE = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+_CL_ETHUSD_DECIMALS: Optional[int] = None
 
-    Priority order:
-    1) Ankr price history near the tx timestamp with local hourly cache.
-    2) CoinGecko daily history (cached on disk) as a backup.
-    3) Optional live fallback (DexScreener) only if allow_live_fallback=True.
+def _abi_int256_from_32(word: bytes) -> int:
+    # word is 32 bytes, two's complement
+    as_int = int.from_bytes(word, byteorder="big", signed=False)
+    if as_int >= 2**255:
+        as_int -= 2**256
+    return as_int
+
+def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
+    """Return ETH/USD using Chainlink's Base ETH/USD feed at a specific block.
+
+    This uses eth_call with a block tag, so it requires an RPC that can serve historical state (archive).
     """
-
-    # 1) Timestamp-based Ankr history with cache
-    ts: Optional[int] = None
-    if block_number is not None:
-        ts = _get_block_timestamp(block_number)
-
-    if ts is not None:
-        hour = int(ts) - (int(ts) % 3600)
-        cache = _load_eth_price_cache()
-        key = f"eth:{hour}"
-        if key in cache and cache[key] > 0:
-            return float(cache[key])
-
-        # First try Ankr hourly history (preferred).
-        p = _eth_usd_from_ankr_history(int(ts))
-        if p is None or p <= 0:
-            # Backup: daily (CoinGecko) to reduce rate limit risk.
-            date_utc = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
-            p = _eth_usd_daily(date_utc, ts_hint=int(ts))
-        if p is not None and p > 0:
-            cache[key] = float(p)
-            # keep cache bounded (last ~60 days hourly)
-            if len(cache) > 24 * 60:
-                def _k_to_int(k: str) -> int:
-                    try:
-                        if k.startswith("eth:"):
-                            return int(k.split(":", 1)[1])
-                        return int(k)
-                    except Exception:
-                        return 0
-
-                keys_sorted = sorted(cache.keys(), key=_k_to_int)
-                for k in keys_sorted[:-24 * 60]:
-                    cache.pop(k, None)
-            _save_eth_price_cache(cache)
-            return float(p)
-
-    if not allow_live_fallback:
-        return None
-
-    # 3) Live fallback (explicit only)
+    global _CL_ETHUSD_DECIMALS
     try:
-        p = _dex_best_pair(WETH_ADDRESS)
-        if not p:
+        block_tag = hex(int(block_number))
+        if _CL_ETHUSD_DECIMALS is None:
+            dec_hex = _eth_call(CHAINLINK_ETH_USD_FEED_BASE, "0x313ce567", block_tag)  # decimals()
+            dec = int(dec_hex, 16)
+            if dec <= 0 or dec > 36:
+                return None
+            _CL_ETHUSD_DECIMALS = dec
+
+        data = _eth_call(CHAINLINK_ETH_USD_FEED_BASE, "0xfeaf968c", block_tag)  # latestRoundData()
+        raw = bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith("0x") else b""
+        if len(raw) < 32 * 5:
             return None
-        v2 = p.get("priceUsd")
-        return float(v2) if v2 is not None else None
+        # layout: roundId, answer, startedAt, updatedAt, answeredInRound
+        answer_word = raw[32:64]
+        answer = _abi_int256_from_32(answer_word)
+        if answer <= 0:
+            return None
+        return float(answer) / (10 ** int(_CL_ETHUSD_DECIMALS))
     except Exception:
         return None
 
 
-# =========================
-# Buy aggregation by transaction
+def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: bool = True) -> Optional[float]:
+    """Return ETH/USD.
 
-# =========================
+    Priority order:
+    1) Chainlink ETH/USD feed on Base at the tx block (eth_call with block tag).
+    2) Ankr price history near the tx timestamp with local hourly cache.
+    3) Live fallback (DexScreener) ONLY when allow_live_fallback=True.
+    """
+    # 1) Chainlink per-block, when available
+    if block_number is not None:
+        px = _chainlink_eth_usd_at_block(int(block_number))
+        if px is not None and px > 0:
+            return float(px)
+        if not allow_live_fallback:
+            # For historical scans, do not lie with a live price.
+            return None
+
+    # 2) Ankr hourly cache (near timestamp)
+    try:
+        if block_number is not None:
+            ts = _get_block_timestamp(block_number)
+            if ts:
+                hour_key = time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(int(ts)))
+                cache = _load_eth_hourly_cache()
+                if hour_key in cache and cache[hour_key] > 0:
+                    return float(cache[hour_key])
+
+                # Pull a 24h window and take the closest hour
+                px = _eth_usd_hourly_series_near_ts(int(ts))
+                if px is not None and px > 0:
+                    cache[hour_key] = float(px)
+                    _save_eth_hourly_cache(cache)
+                    return float(px)
+    except Exception:
+        pass
+
+    # 3) Live fallback (only for near-realtime buys if enabled)
+    if allow_live_fallback:
+        try:
+            live = _eth_usd_live()
+            if live is not None and live > 0:
+                return float(live)
+        except Exception:
+            pass
+
+    return None
 
 def _aggregate_net_deltas_from_receipt(
     receipt: Dict[str, Any],
