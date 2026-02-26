@@ -635,31 +635,49 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         clawd_bal_int = _erc20_balance_of(TOKEN_ADDRESS, CLAWD_WALLET)
         weth_bal_int = _erc20_balance_of(WETH_ADDRESS, CLAWD_WALLET)
-    except Exception:
-        await update.message.reply_text("Failed to read balances from RPC.")
+        burned_bal_int = _erc20_balance_of(TOKEN_ADDRESS, BURN_ADDRESS)
+    except Exception as e:
+        await update.message.reply_text(f"Failed to read balances from RPC: {e}")
         return
 
     clawd_amt = _dec(clawd_bal_int, TOKEN_DECIMALS)
     weth_amt = _dec(weth_bal_int, 18)
+    burned_amt = _dec(burned_bal_int, TOKEN_DECIMALS)
 
     clawd_usd = (price or 0.0) * clawd_amt
     weth_usd = (wp or 0.0) * weth_amt
+    burned_usd = (price or 0.0) * burned_amt
+
+    total_value = clawd_usd + weth_usd
+
+    total_supply = 100_000_000_000.0
+    burned_pct = (burned_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
+    burned_bil = burned_amt / 1_000_000_000.0
+
+    wallet_link = f"https://basescan.org/address/{CLAWD_WALLET}"
+    wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
 
     lines: List[str] = []
     lines.append("🔍 $CLAWD Treasury")
-    lines.append("Live onchain data.")
     lines.append("")
     lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
     lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
     lines.append("")
     lines.append("🤖 My Wallet")
-    lines.append(CLAWD_WALLET)
-    lines.append(f"{_fmt_big(clawd_amt)} CLAWD")
-    lines.append(f"≈ {_fmt_int_usd(clawd_usd)}")
-    lines.append(f"{_fmt_weth_two(weth_amt)} WETH")
-    lines.append(f"≈ {_fmt_int_usd(weth_usd)}")
+    lines.append(wallet_html)
+    lines.append(f"{_fmt_big(clawd_amt)} CLAWD · ≈ {_fmt_int_usd(clawd_usd)}")
+    lines.append(f"{_fmt_weth_two(weth_amt)} WETH · ≈ {_fmt_int_usd(weth_usd)}")
+    lines.append("")
+    lines.append(f"Total value: {_fmt_int_usd(total_value)}")
+    lines.append("")
+    lines.append(f"🔥 Burned: {burned_bil:.2f}B CLAWD · ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply")
+    lines.append("")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 
 # =========================
