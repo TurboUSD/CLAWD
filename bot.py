@@ -551,18 +551,17 @@ def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
 def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: bool = True) -> Optional[float]:
     """Return ETH/USD.
 
+    This bot uses ETH/USD mainly to value native-ETH buys.
+    To keep it simple and stable (and avoid "historical state" issues on non-archive RPC),
+    we base the price on timestamp (hourly/daily), not on per-block Chainlink reads.
+
     Priority order:
-    1) Chainlink ETH/USD at the tx block (no external API, matches Basescan fiat value logic closely).
-    2) Ankr price history near the tx timestamp with local hourly cache.
+    1) Ankr price history near the tx timestamp with local hourly cache.
+    2) CoinGecko daily history (cached on disk) as a backup.
     3) Optional live fallback (DexScreener) only if allow_live_fallback=True.
     """
-    # 1) Chainlink at block (best)
-    if block_number is not None:
-        p = _chainlink_eth_usd_at_block(int(block_number))
-        if p is not None and p > 0:
-            return float(p)
 
-    # 2) Ankr history with cache
+    # 1) Timestamp-based Ankr history with cache
     ts: Optional[int] = None
     if block_number is not None:
         ts = _get_block_timestamp(block_number)
@@ -574,8 +573,12 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
         if key in cache and cache[key] > 0:
             return float(cache[key])
 
-        date_utc = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
-        p = _eth_usd_daily(date_utc)
+        # First try Ankr hourly history (preferred).
+        p = _eth_usd_from_ankr_history(int(ts))
+        if p is None or p <= 0:
+            # Backup: daily (CoinGecko) to reduce rate limit risk.
+            date_utc = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
+            p = _eth_usd_daily(date_utc)
         if p is not None and p > 0:
             cache[key] = float(p)
             # keep cache bounded (last ~60 days hourly)
@@ -738,40 +741,47 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     usdc_spent = 0.0
     usdt_spent = 0.0
     weth_spent = 0.0
-    eth_value_spent = 0.0
 
-    # Prefer stablecoin payer
-    if usdc_out > 0 or usdt_out > 0:
-        payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
-        if payer:
-            usdc_spent = _dec(max(0, -usdc_del.get(payer, 0)), 6)
-            usdt_spent = _dec(max(0, -usdt_del.get(payer, 0)), 6)
-            spent_usd += usdc_spent + usdt_spent
-
-    # Fallback: WETH payer
-    if spent_usd <= 0 and weth_out > 0 and payer_weth:
-        payer = payer_weth
-        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
-        weth_spent = _dec(max(0, -weth_del.get(payer, 0)), 18)
-        spent_usd += weth_spent * wp
-        eth_spent_total += weth_spent
-
-    # Add native ETH value (tx.value) if present. This is the primary payment path for
-    # buys executed with ETH (no stablecoin transfer out).
+    # Always fetch tx once. We use tx.value to decide the payment path.
+    tx_from = ""
+    eth_value_int = 0
     try:
         tx = _get_tx(tx_hash)
         tx_from = _norm(tx.get("from", ""))
         eth_value_int = int(tx.get("value", "0x0"), 16)
-        if eth_value_int > 0:
-            # If we didn't already infer a payer from stable/WETH outflow, assume tx.from paid.
-            if payer is None and tx_from:
-                payer = tx_from
-            wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
-            eth_value_spent = _dec(eth_value_int, 18)
-            spent_usd += eth_value_spent * wp
-            eth_spent_total += eth_value_spent
     except Exception:
-        pass
+        tx = None
+
+    # If the tx paid native ETH (tx.value > 0), treat this as an ETH-paid buy.
+    # In that case, ignore any USDC/USDT movements inside the tx (they can be pool
+    # rebalancing, internal router actions, or proceeds), and value ONLY the ETH.
+    paid_with_eth = False
+    if eth_value_int > 0:
+        paid_with_eth = True
+        payer = tx_from or buyer
+        eth_spent_total = _dec(eth_value_int, 18)
+        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False)
+        if wp is None or wp <= 0:
+            return None
+        spent_usd = eth_spent_total * float(wp)
+    else:
+        # Stablecoin path: only count outflows from the inferred payer address.
+        if usdc_out > 0 or usdt_out > 0:
+            payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
+            if payer:
+                usdc_spent = _dec(max(0, -usdc_del.get(payer, 0)), 6)
+                usdt_spent = _dec(max(0, -usdt_del.get(payer, 0)), 6)
+                spent_usd = usdc_spent + usdt_spent
+
+        # Fallback: WETH path
+        if spent_usd <= 0 and weth_out > 0 and payer_weth:
+            payer = payer_weth
+            wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False)
+            if wp is None or wp <= 0:
+                return None
+            weth_spent = _dec(max(0, -weth_del.get(payer, 0)), 18)
+            spent_usd = weth_spent * float(wp)
+            eth_spent_total = weth_spent
 
         # Require real payment outflow. This avoids false positives like LP withdrawals
     # where the wallet receives both TOKEN and stables in the same tx.
@@ -780,8 +790,9 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
 
     total_usd = spent_usd
 
-    # Coherence filter to kill false positives
-    if usd_est > 0 and spent_usd > 0:
+    # Coherence filter to kill false positives.
+    # Skip for native-ETH buys: token price estimates can drift and should not block valid buys.
+    if (not paid_with_eth) and usd_est > 0 and spent_usd > 0:
         if spent_usd < usd_est * 0.20:
             return None
         if spent_usd > usd_est * 5.0:
@@ -982,6 +993,35 @@ async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> Non
         )
 
 
+def _payment_line(kind: str, pay: Optional[Dict[str, float]]) -> str:
+    """Format the payment section for buy alerts.
+
+    Rules:
+    - Only for kind == "buy".
+    - Show ETH line if eth > 0.
+    - Show USDC/USDT line if spent > 0.
+    - Always end with a newline so the following Wallet line stays on its own line.
+    """
+    if kind != "buy" or not pay:
+        return ""
+
+    lines: List[str] = []
+    eth = float(pay.get("eth") or 0.0)
+    usdc = float(pay.get("usdc") or 0.0)
+    usdt = float(pay.get("usdt") or 0.0)
+
+    if eth > 0:
+        lines.append(f"ETH: {eth:.2f}")
+    if usdc > 0:
+        lines.append(f"USDC: {int(round(usdc)):,}")
+    if usdt > 0:
+        lines.append(f"USDT: {int(round(usdt)):,}")
+
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
 def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str, pay: Optional[Dict[str, float]] = None) -> str:
     state = _load_state()
     usd_per_emoji = float(state["emoji_usd"][kind])
@@ -1005,26 +1045,6 @@ def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wa
         + f'Wallet: <a href="{wallet_url}">{_short_addr(wallet_addr)}</a>'
     )
     return caption
-
-def _payment_line(kind: str, pay: dict | None) -> str:
-    if kind != "buy" or not pay:
-        return ""
-
-    parts = []
-
-    if pay.get("eth"):
-        parts.append(f"ETH: {pay['eth']:.2f}")
-
-    if pay.get("usdc"):
-        parts.append(f"USDC: {int(round(pay['usdc'])):,}")
-
-    if pay.get("usdt"):
-        parts.append(f"USDT: {int(round(pay['usdt'])):,}")
-
-    if not parts:
-        return ""
-
-    return "\n" + "\n".join(parts)
 
 
 async def _dm_user(app, user_id: int, text: str) -> bool:
