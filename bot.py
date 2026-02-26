@@ -726,7 +726,7 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             pass
 
     def _run_scan_sync() -> None:
-                t0 = time.time()
+        t0 = time.time()
         _send_dm(f"Scan started. blocks_back={blocks_back} min_usd={_fmt_usd_compact(min_usd)}")
 
         latest = _get_latest_block()
@@ -755,7 +755,7 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
         fail = 0
 
         for i, h in enumerate(tx_hashes, start=1):
-                        try:
+            try:
                 receipt = _get_receipt(h)
                 ok += 1
                 buy = _buy_from_receipt(h, receipt)
@@ -765,7 +765,10 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
                 fail += 1
 
             if i % 200 == 0:
-                _send_dm(f"Progress: {i:,}/{len(tx_hashes):,} ok={ok:,} fail={fail:,} matches={len(matches):,} elapsed={time.time()-t0:.1f}s")
+                _send_dm(
+                    f"Progress: {i:,}/{len(tx_hashes):,} ok={ok:,} fail={fail:,} "
+                    f"matches={len(matches):,} elapsed={time.time()-t0:.1f}s"
+                )
 
         matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
 
@@ -804,7 +807,6 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
         _send_dm("\n".join(lines))
 
     await asyncio.to_thread(_run_scan_sync)
-
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
