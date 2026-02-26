@@ -1,6 +1,24 @@
 import os
 import json
 import asyncio
+
+# ===== Global Task Registry (for /cancel) =====
+TASK_REGISTRY = {}
+_original_create_task = asyncio.create_task
+
+def _tracked_create_task(coro, *args, **kwargs):
+    task = _original_create_task(coro, *args, **kwargs)
+    TASK_REGISTRY[id(task)] = task
+
+    def _cleanup(t):
+        TASK_REGISTRY.pop(id(t), None)
+
+    task.add_done_callback(_cleanup)
+    return task
+
+asyncio.create_task = _tracked_create_task
+# ==============================================
+
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
@@ -135,8 +153,14 @@ def _prune_seen(arr: List[str]) -> List[str]:
 # Formatting
 # =========================
 
-def _norm(a: str) -> str:
-    return (a or "").lower()
+def _norm\(a: str\) -> str:
+    return \(a or \"\"\)\.lower\(\)
+
+def _short_addr(a: str) -> str:
+    a = a or ""
+    if len(a) <= 10:
+        return a
+    return a[:6] + "..." + a[-4:]
 
 
 def _hex_to_int(x: str) -> int:
@@ -380,6 +404,17 @@ def _total_outflow(deltas_for_token: Dict[str, int]) -> int:
     return total
 
 
+def _max_outflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], int]:
+    best_addr = None
+    best_out = 0
+    for addr, d in (deltas_for_token or {}).items():
+        if d < 0 and -d > best_out:
+            best_out = -d
+            best_addr = addr
+    return best_addr, best_out
+
+
+
 def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     token_addresses = {
         TOKEN_ADDRESS: TOKEN_DECIMALS,
@@ -403,7 +438,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         STAKING_CONTRACT_ADDRESS,
     ]
 
-    # Buyer is whoever has the largest net positive CLAWD delta
+    # Receiver of CLAWD (best guess of who bought)
     buyer = _pick_final_buyer(tdel, exclude)
     if not buyer:
         return None
@@ -414,37 +449,75 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
 
     tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
 
-    # Compute USD spent without assuming tx.from is payer.
-    # Prefer stablecoin outflow totals (USDC/USDT).
-    usdc_out_total = _total_outflow(deltas.get(_norm(USDC_ADDRESS)) or {})
-    usdt_out_total = _total_outflow(deltas.get(_norm(USDT_ADDRESS)) or {})
+    # Token USD estimate from price
+    price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    usd_est = (float(price) if price is not None else 0.0) * float(tokens_bought)
 
-    spent_usd = _dec(usdc_out_total, 6) + _dec(usdt_out_total, 6)
-
-    if spent_usd <= 0:
-        # Fallback: use WETH outflow totals + ETH value
+    # Read tx for tx.from + eth value (used for payer selection and ETH-spent)
+    try:
         tx = _get_tx(tx_hash)
+        tx_from = _norm(tx.get("from", ""))
         eth_value_int = int(tx.get("value", "0x0"), 16)
+    except Exception:
+        tx = {}
+        tx_from = ""
+        eth_value_int = 0
 
-        weth_out_total = _total_outflow(deltas.get(_norm(WETH_ADDRESS)) or {})
+    usdc_del = deltas.get(_norm(USDC_ADDRESS)) or {}
+    usdt_del = deltas.get(_norm(USDT_ADDRESS)) or {}
+    weth_del = deltas.get(_norm(WETH_ADDRESS)) or {}
+
+    # Helper: stable/weth outflow for a specific addr
+    def _addr_outflow_usd(addr: str) -> float:
+        if not addr:
+            return 0.0
+        spent = 0.0
+        spent += _dec(max(0, -usdc_del.get(addr, 0)), 6)
+        spent += _dec(max(0, -usdt_del.get(addr, 0)), 6)
         wp = _weth_price_usd() or 0.0
+        spent += _dec(max(0, -weth_del.get(addr, 0)), 18) * wp
+        # Count native ETH value only if tx.from is that addr
+        if addr == tx_from and eth_value_int > 0:
+            spent += _dec(eth_value_int, 18) * wp
+        return spent
 
-        spent_usd = (_dec(weth_out_total, 18) + _dec(eth_value_int, 18)) * wp
+    # Choose payer conservatively to avoid false positives.
+    # Priority: tx.from (if it actually pays), then buyer (if it pays), else reject.
+    spent_from = _addr_outflow_usd(tx_from)
+    spent_buyer = _addr_outflow_usd(buyer)
 
-    # Final fallback: estimate from tokens received * token USD price
-    if spent_usd <= 0:
-        price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-        if price is not None and price > 0:
-            spent_usd = float(price) * float(tokens_bought)
+    payer = ""
+    spent_usd = 0.0
 
-    if spent_usd <= 0:
+    if spent_from > 0:
+        payer = tx_from
+        spent_usd = spent_from
+    elif spent_buyer > 0:
+        payer = buyer
+        spent_usd = spent_buyer
+    else:
+        # If neither tx.from nor buyer pays anything, treat as not a buy to avoid false positives.
+        # (Aggregator edge cases where a third wallet pays are intentionally ignored for accuracy.)
         return None
+
+    total_usd = max(spent_usd, usd_est)
+
+    if total_usd <= 0:
+        return None
+
+    # Coherence filter if we have both numbers
+    if usd_est > 0 and spent_usd > 0:
+        if spent_usd < usd_est * 0.10:
+            return None
+        if spent_usd > usd_est * 10.0:
+            return None
 
     return {
         "buyer": buyer,
-        "usd": float(spent_usd),
+        "usd": float(total_usd),
         "tokens": float(tokens_bought),
     }
+
 
 # =========================
 # Stake and burn detection
@@ -485,9 +558,9 @@ async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> Non
 
     if path and os.path.exists(path):
         with open(path, "rb") as f:
-            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
     else:
-        await app.bot.send_message(chat_id=chat_id, text=caption)
+        await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def _dm_user(app, user_id: int, text: str) -> bool:
@@ -891,10 +964,22 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
                     if usd >= float(state_min["stake"]):
                         bar = _emoji_bar(usd, float(state_emoji["stake"]))
                         caption = (
-                            f"{bar} {_fmt_usd_compact(usd)}\n"
-                            f"Amount: {int(round(amount)):,} CLAWD\n"
-                            f"Tx: https://basescan.org/tx/{tx_hash}"
-                        )
+                            tx_url = f"https://basescan.org/tx/{tx_hash}"
+                            from_url = f"https://basescan.org/address/{_from}"
+                            emoji_line = bar
+
+                            caption = (
+                                "<b>CLAWD STAKED!</b>
+
+"
+                                f"{emoji_line}
+
+"
+                                f"CLAWD: {int(round(amount)):,} (<a href=\"{tx_url}\">Tx</a>)
+"
+                                f"Wallet: <a href=\"{from_url}\">{_short_addr(_from)}</a>"
+                            )
+)
                         outgoing.append(("stake", caption))
                     seen_stake.add(event_id)
 
@@ -905,10 +990,22 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
                     if usd >= float(state_min["burn"]):
                         bar = _emoji_bar(usd, float(state_emoji["burn"]))
                         caption = (
-                            f"{bar} {_fmt_usd_compact(usd)}\n"
-                            f"Amount: {int(round(amount)):,} CLAWD\n"
-                            f"Tx: https://basescan.org/tx/{tx_hash}"
-                        )
+                            tx_url = f"https://basescan.org/tx/{tx_hash}"
+                            from_url = f"https://basescan.org/address/{_from}"
+                            emoji_line = bar
+
+                            caption = (
+                                "<b>CLAWD BURNED!</b>
+
+"
+                                f"{emoji_line}
+
+"
+                                f"CLAWD: {int(round(amount)):,} (<a href=\"{tx_url}\">Tx</a>)
+"
+                                f"Wallet: <a href=\"{from_url}\">{_short_addr(_from)}</a>"
+                            )
+)
                         outgoing.append(("burn", caption))
                     seen_burn.add(event_id)
 
@@ -923,24 +1020,44 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
 
         try:
             receipt = _get_receipt(h)
+        except Exception:
+            # Do not mark as seen so it can retry next tick
+            continue
+
+        try:
             buy = _buy_from_receipt(h, receipt)
             if buy:
                 usd = float(buy["usd"])
                 if usd >= float(state_min["buy"]):
-                    bar = _emoji_bar(usd, float(state_emoji["buy"]))
                     tokens = float(buy["tokens"])
                     buyer = buy["buyer"]
+
+                    emoji_line = _emoji_bar(usd, float(state_emoji["buy"]))
+                    tx_url = f"https://basescan.org/tx/{h}"
+                    from_url = f"https://basescan.org/address/{buyer}"
+
                     caption = (
-                        f"{bar} {_fmt_usd_compact(usd)}\n"
-                        f"Buyer: {buyer}\n"
-                        f"Tokens: {int(round(tokens)):,} CLAWD\n"
-                        f"Tx: https://basescan.org/tx/{h}"
+                        "<b>CLAWD BOUGHT!</b>
+
+"
+                        f"{emoji_line}
+
+"
+                        f"CLAWD: {int(round(tokens)):,} (<a href=\"{tx_url}\">Tx</a>)
+"
+                        f"Spent: {_fmt_usd_compact(usd)}
+"
+                        f"Wallet: <a href=\"{from_url}\">{_short_addr(buyer)}</a>"
                     )
+
                     outgoing.append(("buy", caption))
-        except Exception:
-            pass
-        finally:
+
+            # Mark as seen only after successful processing
             seen_buy.add(buy_id)
+
+        except Exception:
+            # Do not mark as seen so it can retry next tick
+            continue
 
     state["watch"]["last_scanned_block"] = end
     state["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
@@ -980,6 +1097,21 @@ async def post_init(app) -> None:
 # Main
 # =========================
 
+
+# ===== Cancel Command =====
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    cancelled = 0
+    for task in list(TASK_REGISTRY.values()):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+
+    await update.message.reply_text(f"Cancelled {cancelled} task(s).")
+# ==========================
+
 def main() -> None:
     _ensure_data_dir()
 
@@ -991,6 +1123,8 @@ def main() -> None:
     app.add_handler(CommandHandler("setemoji", cmd_setemoji))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
+
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
