@@ -73,22 +73,16 @@ TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df52
 # Global Task Registry (for /cancel)
 # =========================
 
-TASK_REGISTRY: Dict[int, asyncio.Task] = {}
-CANCEL_FLAG = False
+TASK_REGISTRY: Dict[str, asyncio.Task] = {}
 
-_original_create_task = asyncio.create_task
+def _track_task(name: str, task: asyncio.Task) -> asyncio.Task:
+    TASK_REGISTRY[name] = task
 
-def _tracked_create_task(coro, *args, **kwargs):
-    task = _original_create_task(coro, *args, **kwargs)
-    TASK_REGISTRY[id(task)] = task
-
-    def _cleanup(t: asyncio.Task) -> None:
-        TASK_REGISTRY.pop(id(t), None)
+    def _cleanup(_t: asyncio.Task) -> None:
+        TASK_REGISTRY.pop(name, None)
 
     task.add_done_callback(_cleanup)
     return task
-
-asyncio.create_task = _tracked_create_task
 
 
 # =========================
@@ -638,24 +632,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # =========================
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global CANCEL_FLAG
     if not update.message:
         return
 
-    CANCEL_FLAG = True
     cancelled = 0
-    for task in list(TASK_REGISTRY.values()):
+    had_monitor = False
+
+    for name, task in list(TASK_REGISTRY.items()):
         if not task.done():
             task.cancel()
             cancelled += 1
+            if name == "monitor":
+                had_monitor = True
 
     await update.message.reply_text(f"Cancelled {cancelled} task(s).")
-    # reset shortly so future tasks can run
-    async def _reset():
-        global CANCEL_FLAG
-        await asyncio.sleep(1)
-        CANCEL_FLAG = False
-    asyncio.create_task(_reset())
+
+    if had_monitor:
+        try:
+            _track_task("monitor", asyncio.create_task(monitor(context.application)))
+            await update.message.reply_text("Monitor restarted.")
+        except Exception:
+            pass
 
 
 async def cmd_setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -729,8 +726,7 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             pass
 
     def _run_scan_sync() -> None:
-        global CANCEL_FLAG
-        t0 = time.time()
+                t0 = time.time()
         _send_dm(f"Scan started. blocks_back={blocks_back} min_usd={_fmt_usd_compact(min_usd)}")
 
         latest = _get_latest_block()
@@ -759,11 +755,7 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
         fail = 0
 
         for i, h in enumerate(tx_hashes, start=1):
-            if CANCEL_FLAG:
-                _send_dm("Scan cancelled.")
-                return
-
-            try:
+                        try:
                 receipt = _get_receipt(h)
                 ok += 1
                 buy = _buy_from_receipt(h, receipt)
@@ -838,7 +830,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Scanning last {blocks_back} blocks for buys >= {_fmt_usd_compact(min_usd)}. Check your DM."
     )
 
-    asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd))
+    _track_task(f"scan:{update.effective_user.id}", asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -890,7 +882,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
 
     lines: List[str] = []
-    lines.append("<b>📊 CLAWD Stats</b>")
+    lines.append("<b>🔍 CLAWD Stats</b>")
     lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
     lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
     lines.append("")
@@ -921,11 +913,7 @@ def _eid(kind: str, tx_hash: str, log_index_hex: str) -> str:
 
 
 def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
-    global CANCEL_FLAG
-    if CANCEL_FLAG:
-        return []
-
-    state = _load_state()
+            state = _load_state()
     latest = _get_latest_block()
     confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
     if confirmed_latest < 0:
@@ -1045,7 +1033,7 @@ async def post_init(app) -> None:
     except Exception:
         pass
 
-    asyncio.create_task(monitor(app))
+    _track_task("monitor", asyncio.create_task(monitor(app)))
 
 
 # =========================
