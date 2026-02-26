@@ -20,6 +20,7 @@ ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 BASE_RPC_URL = (os.environ.get("BASE_RPC_URL", "").strip() or "https://mainnet.base.org")
+ANKR_MULTICHAIN_RPC_URL = os.environ.get("ANKR_MULTICHAIN_RPC_URL", "").strip()
 
 WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "30"))
 WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
@@ -29,6 +30,7 @@ RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))
 
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data")
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
+ETH_PRICE_CACHE_PATH = os.environ.get("ETH_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_cache.json"))
 
 # If ALLOWED_CHAT_ID=0, send to ADMIN_ID in private for testing
 if ALLOWED_CHAT_ID == 0:
@@ -114,6 +116,8 @@ DEFAULT_STATE: Dict[str, Any] = {
         "last_scanned_block": 0,
         "seen": {"buy": [], "stake": [], "burn": []},
         "sent": {"buy": [], "stake": [], "burn": []},
+        "sent_public": {"buy": [], "stake": [], "burn": []},
+        "sent_dm": {"buy": [], "stake": [], "burn": []},
     },
     "cache": {
         "token_price_usd": None,
@@ -148,6 +152,12 @@ def _load_state() -> Dict[str, Any]:
         if isinstance(s.get("watch", {}).get("sent"), dict):
             merged["watch"].setdefault("sent", {"buy": [], "stake": [], "burn": []})
             merged["watch"]["sent"].update(s["watch"]["sent"])
+        if isinstance(s.get("watch", {}).get("sent_public"), dict):
+            merged["watch"].setdefault("sent_public", {"buy": [], "stake": [], "burn": []})
+            merged["watch"]["sent_public"].update(s["watch"]["sent_public"])
+        if isinstance(s.get("watch", {}).get("sent_dm"), dict):
+            merged["watch"].setdefault("sent_dm", {"buy": [], "stake": [], "burn": []})
+            merged["watch"]["sent_dm"].update(s["watch"]["sent_dm"])
         if isinstance(s.get("cache"), dict):
             merged["cache"].update(s["cache"])
 
@@ -155,6 +165,10 @@ def _load_state() -> Dict[str, Any]:
             merged["watch"]["seen"][k] = list(merged["watch"]["seen"].get(k) or [])
             merged["watch"].setdefault("sent", {}).setdefault(k, [])
             merged["watch"]["sent"][k] = list(merged["watch"]["sent"].get(k) or [])
+            merged["watch"].setdefault("sent_public", {}).setdefault(k, [])
+            merged["watch"]["sent_public"][k] = list(merged["watch"]["sent_public"].get(k) or [])
+            merged["watch"].setdefault("sent_dm", {}).setdefault(k, [])
+            merged["watch"]["sent_dm"][k] = list(merged["watch"]["sent_dm"].get(k) or [])
 
         return merged
     except Exception:
@@ -356,6 +370,7 @@ def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional
 
 
 
+
 def _get_block_timestamp(block_number: int) -> Optional[int]:
     try:
         blk = _rpc("eth_getBlockByNumber", [hex(block_number), False])
@@ -367,35 +382,109 @@ def _get_block_timestamp(block_number: int) -> Optional[int]:
     return None
 
 
-def _coingecko_eth_usd_at_ts(ts: int) -> Optional[float]:
-    """Fetch ETH/USD close to the given unix timestamp using CoinGecko market_chart/range."""
+def _load_eth_price_cache() -> Dict[str, float]:
+    _ensure_data_dir()
+    if not os.path.exists(ETH_PRICE_CACHE_PATH):
+        return {}
     try:
-        # Query a small window around the timestamp to get a nearby sample.
-        frm = max(0, int(ts) - 600)
-        to = int(ts) + 600
-        url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range"
-        params = {"vs_currency": "usd", "from": str(frm), "to": str(to)}
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, params=params, headers=headers, timeout=25)
-        r.raise_for_status()
-        j = r.json()
-        prices = j.get("prices") or []
-        if not prices:
+        with open(ETH_PRICE_CACHE_PATH, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, dict):
+            return {str(k): float(v) for k, v in j.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_eth_price_cache(cache: Dict[str, float]) -> None:
+    _ensure_data_dir()
+    tmp = ETH_PRICE_CACHE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ETH_PRICE_CACHE_PATH)
+
+
+def _ankr_multichain_rpc(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Call Ankr Advanced API (multichain) JSON-RPC methods like ankr_getTokenPriceHistory.
+    Requires ANKR_MULTICHAIN_RPC_URL to be set, eg:
+      https://rpc.ankr.com/multichain/<YOUR_API_KEY>
+    """
+    if not ANKR_MULTICHAIN_RPC_URL:
+        raise RuntimeError("ANKR_MULTICHAIN_RPC_URL not set")
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(ANKR_MULTICHAIN_RPC_URL, json=payload, timeout=25, headers={"Content-Type": "application/json"})
+    r.raise_for_status()
+    j = r.json()
+    if isinstance(j, dict) and j.get("error"):
+        raise RuntimeError(str(j["error"]))
+    return j.get("result") or {}
+
+
+def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
+    """
+    Fetch ETH/USD close to ts using Ankr Token API price history.
+    We query on Base native coin price history (contractAddress omitted).
+    """
+    try:
+        # Round to hour to reduce requests
+        hour = int(ts) - (int(ts) % 3600)
+        frm = max(0, hour - 3600)
+        to = hour + 3600
+        res = _ankr_multichain_rpc("ankr_getTokenPriceHistory", {
+            "blockchain": "base",
+            "fromTimestamp": frm,
+            "toTimestamp": to,
+            "interval": 3600,
+            "limit": 5,
+            "syncCheck": False,
+        })
+        quotes = res.get("quotes") or []
+        if not quotes:
             return None
-        # prices: [[ms, price], ...]
-        target_ms = int(ts) * 1000
-        best = min(prices, key=lambda it: abs(int(it[0]) - target_ms))
-        return float(best[1])
+        best = min(quotes, key=lambda q: abs(int(q.get("timestamp") or 0) - int(ts)))
+        p = best.get("usdPrice")
+        return float(p) if p is not None else None
     except Exception:
         return None
 
 
-
 def _weth_price_usd(block_number: Optional[int] = None) -> Optional[float]:
-    # 1) Best effort: Chainlink read at the tx block (requires an archive-capable RPC).
-    v = _chainlink_latest_answer(CHAINLINK_ETH_USD_FEED, block_number=block_number)
-    if v is not None and v > 0:
-        return float(v)
+    """
+    Historical ETH/USD for a tx. Primary source is Ankr Token API history with local hourly cache.
+    Falls back to DexScreener only if no historical source is available.
+    """
+    ts: Optional[int] = None
+    if block_number is not None:
+        ts = _get_block_timestamp(block_number)
+
+    if ts is not None:
+        hour = int(ts) - (int(ts) % 3600)
+        cache = _load_eth_price_cache()
+        key = str(hour)
+        if key in cache and cache[key] > 0:
+            return float(cache[key])
+
+        p = _eth_usd_from_ankr_history(ts)
+        if p is not None and p > 0:
+            cache[key] = float(p)
+            # keep cache bounded (last ~60 days hourly)
+            if len(cache) > 24 * 60:
+                keys_sorted = sorted(cache.keys(), key=lambda x: int(x))
+                for k in keys_sorted[:-24 * 60]:
+                    cache.pop(k, None)
+            _save_eth_price_cache(cache)
+            return float(p)
+
+    # Last resort: current-ish price from DexScreener (not historical).
+    try:
+        p = _dex_best_pair(WETH_ADDRESS)
+        if not p:
+            return None
+        v2 = p.get("priceUsd")
+        return float(v2) if v2 is not None else None
+    except Exception:
+        return None
 
     # 2) If historic Chainlink read fails, fall back to a timestamp-based historical price.
     if block_number is not None:
@@ -1289,28 +1378,28 @@ async def monitor(app) -> None:
 
             # Dedup at send-time to prevent double alerts (restart, overlap, RPC hiccups)
             state = _load_state()
-            state.setdefault("watch", {}).setdefault("sent", {"buy": [], "stake": [], "burn": []})
+            state.setdefault("watch", {}).setdefault("sent_public", {"buy": [], "stake": [], "burn": []})
 
-            sent_buy = set(state["watch"]["sent"].get("buy") or [])
-            sent_stake = set(state["watch"]["sent"].get("stake") or [])
-            sent_burn = set(state["watch"]["sent"].get("burn") or [])
+            sent_buy = set(state["watch"]["sent_public"].get("buy") or [])
+            sent_stake = set(state["watch"]["sent_public"].get("stake") or [])
+            sent_burn = set(state["watch"]["sent_public"].get("burn") or [])
 
             for kind, uid, caption, _wallet in outgoing:
                 if kind == "buy":
                     if uid in sent_buy:
                         continue
                     sent_buy.add(uid)
-                    state["watch"]["sent"]["buy"] = _prune_seen(list(sent_buy))
+                    state["watch"]["sent_public"]["buy"] = _prune_seen(list(sent_buy))
                 elif kind == "stake":
                     if uid in sent_stake:
                         continue
                     sent_stake.add(uid)
-                    state["watch"]["sent"]["stake"] = _prune_seen(list(sent_stake))
+                    state["watch"]["sent_public"]["stake"] = _prune_seen(list(sent_stake))
                 elif kind == "burn":
                     if uid in sent_burn:
                         continue
                     sent_burn.add(uid)
-                    state["watch"]["sent"]["burn"] = _prune_seen(list(sent_burn))
+                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
 
                 # Persist before sending to avoid duplicates if the process crashes after send
                 _save_state(state)
