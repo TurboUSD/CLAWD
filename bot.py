@@ -269,15 +269,18 @@ def _fmt_usd_compact(x: float) -> str:
     return f"${x:.2f}"
 
 
-def _emoji_bar(total_usd: float, usd_per_emoji: float) -> str:
+def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
     if usd_per_emoji <= 0:
         usd_per_emoji = 100.0
+
     n = int(total_usd / usd_per_emoji)
+
     if n < 1:
         n = 1
     if n > MAX_EMOJIS:
         n = MAX_EMOJIS
-    return LOBSTER * n
+
+    return emoji * n
 
 
 # =========================
@@ -1076,20 +1079,32 @@ def _payment_line(kind: str, pay: Optional[Dict[str, float]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str, pay: Optional[Dict[str, float]] = None) -> str:
+def _event_caption(
+    kind: str,
+    tx_hash: str,
+    amount_tokens: float,
+    usd: float,
+    wallet_addr: str,
+    pay: Optional[Dict[str, float]] = None
+) -> str:
+
     state = _load_state()
     usd_per_emoji = float(state["emoji_usd"][kind])
-    bar = _emoji_bar(usd, usd_per_emoji)
-
-    tx_url = f"https://basescan.org/tx/{tx_hash}"
-    wallet_url = f"https://basescan.org/address/{wallet_addr}"
 
     if kind == "buy":
         title = "CLAWD BOUGHT!"
+        emoji = LOBSTER
     elif kind == "stake":
         title = "CLAWD STAKED!"
+        emoji = "🔒"
     else:
         title = "CLAWD BURNED!"
+        emoji = "🔥"
+
+    bar = _emoji_bar(usd, usd_per_emoji, emoji)
+
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    wallet_url = f"https://basescan.org/address/{wallet_addr}"
 
     caption = (
         f"<b>{title}</b>\n\n"
@@ -1098,6 +1113,7 @@ def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wa
         + (_payment_line(kind, pay) if kind == "buy" else "")
         + f'Wallet: <a href="{wallet_url}">{_short_addr(wallet_addr)}</a>'
     )
+
     return caption
 
 
