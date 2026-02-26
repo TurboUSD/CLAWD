@@ -457,14 +457,51 @@ def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
         return None
 
 
+
+def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
+    """
+    Read Chainlink ETH/USD price at a specific block using eth_call with block tag.
+    This avoids any external HTTP price APIs and works on standard (non-archive) RPC
+    as long as the block is still available (recent history).
+    """
+    try:
+        # latestRoundData() selector
+        data = "0x" + "feaf968c"
+        res = _rpc("eth_call", [{
+            "to": CHAINLINK_ETH_USD_FEED,
+            "data": data,
+        }, hex(int(block_number))])
+        if not isinstance(res, str) or not res.startswith("0x"):
+            return None
+        raw = bytes.fromhex(res[2:])
+        if len(raw) < 32 * 5:
+            return None
+        # return values: (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
+        answer_bytes = raw[32:64]
+        answer = int.from_bytes(answer_bytes, byteorder="big", signed=True)
+        if answer <= 0:
+            return None
+        # Chainlink ETH/USD feeds are typically 8 decimals
+        return float(answer) / 1e8
+    except Exception:
+        return None
+
+
 def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: bool = True) -> Optional[float]:
     """Return ETH/USD.
 
-    Primary: Ankr price history near the tx timestamp with local hourly cache.
-
-    If allow_live_fallback is False, this function will NEVER return a live price.
-    That prevents inflated USD values when historical data is unavailable.
+    Priority order:
+    1) Chainlink ETH/USD at the tx block (no external API, matches Basescan fiat value logic closely).
+    2) Ankr price history near the tx timestamp with local hourly cache.
+    3) Optional live fallback (DexScreener) only if allow_live_fallback=True.
     """
+    # 1) Chainlink at block (best)
+    if block_number is not None:
+        p = _chainlink_eth_usd_at_block(int(block_number))
+        if p is not None and p > 0:
+            return float(p)
+
+    # 2) Ankr history with cache
     ts: Optional[int] = None
     if block_number is not None:
         ts = _get_block_timestamp(block_number)
@@ -472,8 +509,6 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
     if ts is not None:
         hour = int(ts) - (int(ts) % 3600)
         cache = _load_eth_price_cache()
-        # Namespace the cache key so older cached values (from previous logic)
-        # can't poison historical lookups.
         key = f"eth:{hour}"
         if key in cache and cache[key] > 0:
             return float(cache[key])
@@ -500,7 +535,7 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
     if not allow_live_fallback:
         return None
 
-    # Last resort (live): DexScreener. Use only when explicitly allowed.
+    # 3) Live fallback (explicit only)
     try:
         p = _dex_best_pair(WETH_ADDRESS)
         if not p:
@@ -513,6 +548,7 @@ def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: 
 
 # =========================
 # Buy aggregation by transaction
+
 # =========================
 
 def _aggregate_net_deltas_from_receipt(
