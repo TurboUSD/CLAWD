@@ -55,6 +55,10 @@ STAKING_CONTRACT_ADDRESS = os.environ.get("STAKING_CONTRACT_ADDRESS", "").strip(
 USDC_ADDRESS = os.environ.get("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
 USDT_ADDRESS = os.environ.get("USDT_ADDRESS", "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA").strip()
 WETH_ADDRESS = os.environ.get("WETH_ADDRESS", "0x4200000000000000000000000000000000000006").strip()
+CHAINLINK_ETH_USD_FEED = os.environ.get(
+    "CHAINLINK_ETH_USD_FEED",
+    "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"  # Base Mainnet ETH/USD
+).strip()
 
 # Images (place these files in your repo)
 ASSET_BUY = os.environ.get("ASSET_BUY", "assets/buy.png")
@@ -244,6 +248,33 @@ def _erc20_balance_of(token: str, holder: str) -> int:
     out = _rpc("eth_call", [{"to": token, "data": data}, "latest"])
     return int(out, 16)
 
+def _eth_call(to: str, data: str) -> str:
+    return _rpc("eth_call", [{"to": to, "data": data}, "latest"])
+
+
+def _chainlink_decimals(feed: str) -> int:
+    out = _eth_call(feed, "0x313ce567")  # decimals()
+    return int(out, 16)
+
+
+def _chainlink_latest_answer(feed: str) -> Optional[float]:
+    try:
+        dec = _chainlink_decimals(feed)
+        out = _eth_call(feed, "0xfeaf968c")  # latestRoundData()
+        # latestRoundData returns (roundId, answer, startedAt, updatedAt, answeredInRound)
+        # answer is the 2nd slot (32 bytes) after roundId
+        answer_int = int(out[2 + 64:2 + 128], 16)
+        return answer_int / (10 ** dec)
+    except Exception:
+        return None
+
+
+def _get_cache(state: Dict[str, Any]) -> Dict[str, Any]:
+    c = state.get("cache")
+    if isinstance(c, dict):
+        return c
+    state["cache"] = {}
+    return state["cache"]
 
 # =========================
 # Pricing (DexScreener)
@@ -251,7 +282,8 @@ def _erc20_balance_of(token: str, holder: str) -> int:
 
 def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
-    r = requests.get(url, timeout=25)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, timeout=25, headers=headers)
     r.raise_for_status()
     j = r.json()
     pairs = j.get("pairs") or []
@@ -262,24 +294,33 @@ def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
 
 
 def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional[float]]:
+    # Try DexScreener, and if it fails return None so cmd_stats can fall back to cached values
     try:
         p = _dex_best_pair(token_addr)
         if not p:
             return None, None
         price = p.get("priceUsd")
         fdv = p.get("fdv")
-        return (float(price) if price is not None else None, float(fdv) if fdv is not None else None)
+        price_f = float(price) if price is not None else None
+        fdv_f = float(fdv) if fdv is not None else None
+        return price_f, fdv_f
     except Exception:
         return None, None
 
 
 def _weth_price_usd() -> Optional[float]:
+    # Primary: Chainlink ETH/USD on Base
+    v = _chainlink_latest_answer(CHAINLINK_ETH_USD_FEED)
+    if v is not None and v > 0:
+        return float(v)
+
+    # Fallback: DexScreener
     try:
         p = _dex_best_pair(WETH_ADDRESS)
         if not p:
             return None
-        v = p.get("priceUsd")
-        return float(v) if v is not None else None
+        v2 = p.get("priceUsd")
+        return float(v2) if v2 is not None else None
     except Exception:
         return None
 
@@ -653,8 +694,26 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
+    state = _load_state()
+    cache = state.get("cache") or {}
+    state["cache"] = cache
+
     price, fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
     wp = _weth_price_usd()
+
+    # Cache token price and fdv when available
+    if price is not None:
+        cache["token_price_usd"] = float(price)
+    if fdv is not None:
+        cache["token_fdv"] = float(fdv)
+
+    # Fallback to cached values if API fails
+    if price is None:
+        price = cache.get("token_price_usd")
+    if fdv is None:
+        fdv = cache.get("token_fdv")
+
+    _save_state(state)
 
     try:
         clawd_bal_int = _erc20_balance_of(TOKEN_ADDRESS, CLAWD_WALLET)
@@ -703,17 +762,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             disable_web_page_preview=True
         )
     except Exception as e:
-        # Fallback without HTML so you always see something
         await update.message.reply_text(f"stats send failed: {e}")
         await update.message.reply_text("\n".join([
             "CLAWD stats (plain fallback)",
             f"Current price: {_fmt_price(price) if price is not None else 'N/A'}",
             f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}",
             f"My Wallet: {CLAWD_WALLET}",
-            f"{_fmt_big(clawd_amt)} CLAWD ≈ {_fmt_int_usd(clawd_usd)}",
-            f"{_fmt_weth_two(weth_amt)} WETH ≈ {_fmt_int_usd(weth_usd)}",
+            f"{_fmt_big(clawd_amt)} CLAWD ({_fmt_int_usd(clawd_usd)})",
+            f"{_fmt_weth_two(weth_amt)} WETH ({_fmt_int_usd(weth_usd)})",
             f"Total value: {_fmt_int_usd(total_value)}",
-            f"Burned: {burned_bil:.2f}B CLAWD ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply",
+            f"Burned: {burned_bil:.2f}B CLAWD ({_fmt_int_usd(burned_usd)}) · {burned_pct:.2f}% of supply",
         ]), disable_web_page_preview=True)
 
 
