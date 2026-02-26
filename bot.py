@@ -1,24 +1,7 @@
 import os
 import json
 import asyncio
-
-# ===== Global Task Registry (for /cancel) =====
-TASK_REGISTRY = {}
-_original_create_task = asyncio.create_task
-
-def _tracked_create_task(coro, *args, **kwargs):
-    task = _original_create_task(coro, *args, **kwargs)
-    TASK_REGISTRY[id(task)] = task
-
-    def _cleanup(t):
-        TASK_REGISTRY.pop(id(t), None)
-
-    task.add_done_callback(_cleanup)
-    return task
-
-asyncio.create_task = _tracked_create_task
-# ==============================================
-
+import time
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
@@ -28,7 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 
 # =========================
-# Environment variables 
+# Environment variables
 # =========================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -46,7 +29,6 @@ RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))
 DATA_PATH = os.environ.get("DATA_PATH", "/app/data")
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
 
-# Destination chat for watcher posts
 # If ALLOWED_CHAT_ID=0, send to ADMIN_ID in private for testing
 if ALLOWED_CHAT_ID == 0:
     if not ADMIN_ID:
@@ -66,19 +48,17 @@ TOKEN_DECIMALS = int(os.environ.get("TOKEN_DECIMALS", "18"))
 CLAWD_WALLET = os.environ.get("CLAWD_WALLET_ADDRESS", "0x90eF2A9211A3E7CE788561E5af54C76B0Fa3aEd0").strip()
 BURN_ADDRESS = os.environ.get("BURN_ADDRESS", "0x000000000000000000000000000000000000dEaD").strip()
 
-# Needed for stake detection via Transfer(to=staking_contract)
 STAKING_CONTRACT_ADDRESS = os.environ.get("STAKING_CONTRACT_ADDRESS", "").strip()
 
-# Base defaults (override in Railway if you want)
 USDC_ADDRESS = os.environ.get("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
 USDT_ADDRESS = os.environ.get("USDT_ADDRESS", "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA").strip()
 WETH_ADDRESS = os.environ.get("WETH_ADDRESS", "0x4200000000000000000000000000000000000006").strip()
+
 CHAINLINK_ETH_USD_FEED = os.environ.get(
     "CHAINLINK_ETH_USD_FEED",
-    "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"  # Base Mainnet ETH/USD
+    "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 ).strip()
 
-# Images (place these files in your repo)
 ASSET_BUY = os.environ.get("ASSET_BUY", "assets/buy.png")
 ASSET_STAKE = os.environ.get("ASSET_STAKE", "assets/stake.png")
 ASSET_BURN = os.environ.get("ASSET_BURN", "assets/burn.png")
@@ -90,16 +70,42 @@ TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df52
 
 
 # =========================
+# Global Task Registry (for /cancel)
+# =========================
+
+TASK_REGISTRY: Dict[int, asyncio.Task] = {}
+CANCEL_FLAG = False
+
+_original_create_task = asyncio.create_task
+
+def _tracked_create_task(coro, *args, **kwargs):
+    task = _original_create_task(coro, *args, **kwargs)
+    TASK_REGISTRY[id(task)] = task
+
+    def _cleanup(t: asyncio.Task) -> None:
+        TASK_REGISTRY.pop(id(t), None)
+
+    task.add_done_callback(_cleanup)
+    return task
+
+asyncio.create_task = _tracked_create_task
+
+
+# =========================
 # State
 # =========================
 
 DEFAULT_STATE: Dict[str, Any] = {
-    "min_usd": {"buy": 10000.0, "stake": 10000.0, "burn": 10000.0},
+    "min_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "emoji_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "watch": {
         "last_scanned_block": 0,
         "seen": {"buy": [], "stake": [], "burn": []},
     },
+    "cache": {
+        "token_price_usd": None,
+        "token_fdv": None,
+    }
 }
 
 
@@ -126,6 +132,8 @@ def _load_state() -> Dict[str, Any]:
             merged["watch"].update(s["watch"])
         if isinstance(s.get("watch", {}).get("seen"), dict):
             merged["watch"]["seen"].update(s["watch"]["seen"])
+        if isinstance(s.get("cache"), dict):
+            merged["cache"].update(s["cache"])
 
         for k in ("buy", "stake", "burn"):
             merged["watch"]["seen"][k] = list(merged["watch"]["seen"].get(k) or [])
@@ -153,14 +161,17 @@ def _prune_seen(arr: List[str]) -> List[str]:
 # Formatting
 # =========================
 
-def _norm\(a: str\) -> str:
-    return \(a or \"\"\)\.lower\(\)
+def _norm(a: str) -> str:
+    return (a or "").lower()
+
 
 def _short_addr(a: str) -> str:
-    a = a or ""
-    if len(a) <= 10:
+    if not a:
+        return ""
+    a = a.strip()
+    if len(a) <= 12:
         return a
-    return a[:6] + "..." + a[-4:]
+    return f"{a[:6]}…{a[-4:]}"
 
 
 def _hex_to_int(x: str) -> int:
@@ -188,6 +199,10 @@ def _fmt_big(n: float) -> str:
     if n >= 1_000:
         return f"{n/1_000:.2f}K"
     return f"{n:.0f}"
+
+
+def _fmt_token_amount(n: float) -> str:
+    return f"{n:,.0f}"
 
 
 def _fmt_weth_two(n: float) -> str:
@@ -272,12 +287,13 @@ def _erc20_balance_of(token: str, holder: str) -> int:
     out = _rpc("eth_call", [{"to": token, "data": data}, "latest"])
     return int(out, 16)
 
+
 def _eth_call(to: str, data: str) -> str:
     return _rpc("eth_call", [{"to": to, "data": data}, "latest"])
 
 
 def _chainlink_decimals(feed: str) -> int:
-    out = _eth_call(feed, "0x313ce567")  # decimals()
+    out = _eth_call(feed, "0x313ce567")
     return int(out, 16)
 
 
@@ -285,23 +301,14 @@ def _chainlink_latest_answer(feed: str) -> Optional[float]:
     try:
         dec = _chainlink_decimals(feed)
         out = _eth_call(feed, "0xfeaf968c")  # latestRoundData()
-        # latestRoundData returns (roundId, answer, startedAt, updatedAt, answeredInRound)
-        # answer is the 2nd slot (32 bytes) after roundId
         answer_int = int(out[2 + 64:2 + 128], 16)
         return answer_int / (10 ** dec)
     except Exception:
         return None
 
 
-def _get_cache(state: Dict[str, Any]) -> Dict[str, Any]:
-    c = state.get("cache")
-    if isinstance(c, dict):
-        return c
-    state["cache"] = {}
-    return state["cache"]
-
 # =========================
-# Pricing (DexScreener)
+# Pricing (DexScreener + Chainlink)
 # =========================
 
 def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
@@ -318,27 +325,21 @@ def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
 
 
 def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional[float]]:
-    # Try DexScreener, and if it fails return None so cmd_stats can fall back to cached values
     try:
         p = _dex_best_pair(token_addr)
         if not p:
             return None, None
         price = p.get("priceUsd")
         fdv = p.get("fdv")
-        price_f = float(price) if price is not None else None
-        fdv_f = float(fdv) if fdv is not None else None
-        return price_f, fdv_f
+        return (float(price) if price is not None else None, float(fdv) if fdv is not None else None)
     except Exception:
         return None, None
 
 
 def _weth_price_usd() -> Optional[float]:
-    # Primary: Chainlink ETH/USD on Base
     v = _chainlink_latest_answer(CHAINLINK_ETH_USD_FEED)
     if v is not None and v > 0:
         return float(v)
-
-    # Fallback: DexScreener
     try:
         p = _dex_best_pair(WETH_ADDRESS)
         if not p:
@@ -395,15 +396,6 @@ def _pick_final_buyer(token_deltas: Dict[str, int], exclude_addrs: List[str]) ->
     return best_addr
 
 
-def _total_outflow(deltas_for_token: Dict[str, int]) -> int:
-    # Sum of all negative deltas (outflows) across all addresses
-    total = 0
-    for _addr, d in (deltas_for_token or {}).items():
-        if d < 0:
-            total += -d
-    return total
-
-
 def _max_outflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], int]:
     best_addr = None
     best_out = 0
@@ -412,7 +404,6 @@ def _max_outflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], 
             best_out = -d
             best_addr = addr
     return best_addr, best_out
-
 
 
 def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -424,7 +415,6 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     }
 
     deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
-
     tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
     if not tdel:
         return None
@@ -438,7 +428,6 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         STAKING_CONTRACT_ADDRESS,
     ]
 
-    # Receiver of CLAWD (best guess of who bought)
     buyer = _pick_final_buyer(tdel, exclude)
     if not buyer:
         return None
@@ -449,67 +438,66 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
 
     tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
 
-    # Token USD estimate from price
-    price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-    usd_est = (float(price) if price is not None else 0.0) * float(tokens_bought)
+    # Price estimate for sanity filtering
+    state = _load_state()
+    cache = state.get("cache") or {}
+    state["cache"] = cache
 
-    # Read tx for tx.from + eth value (used for payer selection and ETH-spent)
-    try:
-        tx = _get_tx(tx_hash)
-        tx_from = _norm(tx.get("from", ""))
-        eth_value_int = int(tx.get("value", "0x0"), 16)
-    except Exception:
-        tx = {}
-        tx_from = ""
-        eth_value_int = 0
+    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    if price is not None:
+        cache["token_price_usd"] = float(price)
+    else:
+        price = cache.get("token_price_usd")
+
+    _save_state(state)
+
+    usd_est = (float(price) if price is not None else 0.0) * float(tokens_bought)
 
     usdc_del = deltas.get(_norm(USDC_ADDRESS)) or {}
     usdt_del = deltas.get(_norm(USDT_ADDRESS)) or {}
     weth_del = deltas.get(_norm(WETH_ADDRESS)) or {}
 
-    # Helper: stable/weth outflow for a specific addr
-    def _addr_outflow_usd(addr: str) -> float:
-        if not addr:
-            return 0.0
-        spent = 0.0
-        spent += _dec(max(0, -usdc_del.get(addr, 0)), 6)
-        spent += _dec(max(0, -usdt_del.get(addr, 0)), 6)
-        wp = _weth_price_usd() or 0.0
-        spent += _dec(max(0, -weth_del.get(addr, 0)), 18) * wp
-        # Count native ETH value only if tx.from is that addr
-        if addr == tx_from and eth_value_int > 0:
-            spent += _dec(eth_value_int, 18) * wp
-        return spent
+    payer_usdc, usdc_out = _max_outflow_addr(usdc_del)
+    payer_usdt, usdt_out = _max_outflow_addr(usdt_del)
+    payer_weth, weth_out = _max_outflow_addr(weth_del)
 
-    # Choose payer conservatively to avoid false positives.
-    # Priority: tx.from (if it actually pays), then buyer (if it pays), else reject.
-    spent_from = _addr_outflow_usd(tx_from)
-    spent_buyer = _addr_outflow_usd(buyer)
-
-    payer = ""
+    payer = None
     spent_usd = 0.0
 
-    if spent_from > 0:
-        payer = tx_from
-        spent_usd = spent_from
-    elif spent_buyer > 0:
-        payer = buyer
-        spent_usd = spent_buyer
-    else:
-        # If neither tx.from nor buyer pays anything, treat as not a buy to avoid false positives.
-        # (Aggregator edge cases where a third wallet pays are intentionally ignored for accuracy.)
-        return None
+    # Prefer stablecoin payer
+    if usdc_out > 0 or usdt_out > 0:
+        payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
+        if payer:
+            spent_usd += _dec(max(0, -usdc_del.get(payer, 0)), 6)
+            spent_usd += _dec(max(0, -usdt_del.get(payer, 0)), 6)
+
+    # Fallback: WETH payer
+    if spent_usd <= 0 and weth_out > 0 and payer_weth:
+        payer = payer_weth
+        wp = _weth_price_usd() or 0.0
+        spent_usd += _dec(max(0, -weth_del.get(payer, 0)), 18) * wp
+
+    # Add ETH value only if tx.value > 0 and tx.from is buyer or payer
+    try:
+        tx = _get_tx(tx_hash)
+        tx_from = _norm(tx.get("from", ""))
+        eth_value_int = int(tx.get("value", "0x0"), 16)
+        if eth_value_int > 0 and tx_from and (tx_from == buyer or (payer and tx_from == payer)):
+            wp = _weth_price_usd() or 0.0
+            spent_usd += _dec(eth_value_int, 18) * wp
+    except Exception:
+        pass
 
     total_usd = max(spent_usd, usd_est)
 
     if total_usd <= 0:
         return None
 
-    # Coherence filter if we have both numbers
+    # Coherence filter to kill false positives
     if usd_est > 0 and spent_usd > 0:
-        if spent_usd < usd_est * 0.10:
+        if spent_usd < usd_est * 0.20:
             return None
-        if spent_usd > usd_est * 10.0:
+        if spent_usd > usd_est * 5.0:
             return None
 
     return {
@@ -558,21 +546,57 @@ async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> Non
 
     if path and os.path.exists(path):
         with open(path, "rb") as f:
-            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+            await app.bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=caption,
+                parse_mode="HTML",
+            )
     else:
-        await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
+def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wallet_addr: str) -> str:
+    state = _load_state()
+    usd_per_emoji = float(state["emoji_usd"][kind])
+    bar = _emoji_bar(usd, usd_per_emoji)
+
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    wallet_url = f"https://basescan.org/address/{wallet_addr}"
+
+    if kind == "buy":
+        title = "CLAWD BOUGHT!"
+        icon = "🦞"
+    elif kind == "stake":
+        title = "CLAWD STAKED!"
+        icon = "🧊"
+    else:
+        title = "CLAWD BURNED!"
+        icon = "🔥"
+
+    caption = (
+        f"<b>{icon} {title}</b>\n\n"
+        f"{bar}\n\n"
+        f"CLAWD: {_fmt_token_amount(amount_tokens)} ({_fmt_int_usd(usd)}) (<a href=\"{tx_url}\">Tx</a>)\n"
+        f"Wallet: <a href=\"{wallet_url}\">{_short_addr(wallet_addr)}</a>"
+    )
+    return caption
 
 
 async def _dm_user(app, user_id: int, text: str) -> bool:
     try:
-        await app.bot.send_message(chat_id=user_id, text=text)
+        await app.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True)
         return True
     except Exception:
         return False
 
 
 def _help_text() -> str:
-    # Keep it short and scannable
     lines = []
     lines.append("Commands")
     lines.append("")
@@ -580,19 +604,20 @@ def _help_text() -> str:
     lines.append("Show this message")
     lines.append("")
     lines.append("/stats")
-    lines.append("Show price, market cap, and CLAWD wallet balances (CLAWD and WETH)")
+    lines.append("Show price, market cap, wallet balances, and burned stats")
     lines.append("")
     lines.append("/scan <blocks_back> <min_buy_usd>")
     lines.append("Scan last N blocks and DM you the buys above the threshold")
-    lines.append("Example: /scan 10 10000")
+    lines.append("Example: /scan 5000 2000")
     lines.append("")
     lines.append("/setmin <buy|stake|burn> <usd>")
     lines.append("Set minimum USD size per event type")
-    lines.append("Example: /setmin buy 5000")
     lines.append("")
     lines.append("/setemoji <buy|stake|burn> <usd_per_emoji>")
     lines.append("Set USD value per lobster emoji (max 100 emojis)")
-    lines.append("Example: /setemoji buy 100")
+    lines.append("")
+    lines.append("/cancel")
+    lines.append("Cancel any running tasks")
     return "\n".join(lines)
 
 
@@ -611,6 +636,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # =========================
 # Commands
 # =========================
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global CANCEL_FLAG
+    if not update.message:
+        return
+
+    CANCEL_FLAG = True
+    cancelled = 0
+    for task in list(TASK_REGISTRY.values()):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+
+    await update.message.reply_text(f"Cancelled {cancelled} task(s).")
+    # reset shortly so future tasks can run
+    async def _reset():
+        global CANCEL_FLAG
+        await asyncio.sleep(1)
+        CANCEL_FLAG = False
+    asyncio.create_task(_reset())
+
 
 async def cmd_setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
@@ -669,19 +715,12 @@ async def cmd_setemoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> None:
-    import time
-    import concurrent.futures
-
-    PROGRESS_EVERY = 200  # receipts per progress update
+    # This scan runs in a thread but sends progress in realtime via run_coroutine_threadsafe
     loop = asyncio.get_running_loop()
 
     def _send_dm(text: str) -> None:
         fut = asyncio.run_coroutine_threadsafe(
-            app.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                disable_web_page_preview=True
-            ),
+            app.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True),
             loop
         )
         try:
@@ -690,8 +729,8 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             pass
 
     def _run_scan_sync() -> None:
+        global CANCEL_FLAG
         t0 = time.time()
-
         _send_dm(f"Scan started. blocks_back={blocks_back} min_usd={_fmt_usd_compact(min_usd)}")
 
         latest = _get_latest_block()
@@ -701,14 +740,8 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
         start = max(0, end - blocks_back + 1)
 
         _send_dm(f"Range: {start} to {end}. Fetching logs...")
-
-        try:
-            logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
-        except Exception as e:
-            _send_dm(f"Scan failed while fetching logs: {e}")
-            return
-
-        _send_dm(f"Logs fetched: {len(logs):,}. Building tx list...")
+        logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
+        _send_dm(f"Logs: {len(logs):,}. Building tx list...")
 
         tx_hashes: List[str] = []
         seen_tx = set()
@@ -719,52 +752,48 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             seen_tx.add(h)
             tx_hashes.append(h)
 
-        _send_dm(f"Unique txs to analyze: {len(tx_hashes):,}. Fetching receipts...")
-
-        state = _load_state()
-        usd_per_emoji = float(state["emoji_usd"]["buy"])
+        _send_dm(f"Unique txs: {len(tx_hashes):,}. Fetching receipts...")
 
         matches: List[Tuple[str, Dict[str, Any]]] = []
-        receipts_ok = 0
-        receipts_fail = 0
+        ok = 0
+        fail = 0
 
         for i, h in enumerate(tx_hashes, start=1):
+            if CANCEL_FLAG:
+                _send_dm("Scan cancelled.")
+                return
+
             try:
                 receipt = _get_receipt(h)
-                receipts_ok += 1
+                ok += 1
                 buy = _buy_from_receipt(h, receipt)
                 if buy and float(buy["usd"]) >= min_usd:
                     matches.append((h, buy))
             except Exception:
-                receipts_fail += 1
+                fail += 1
 
-            if i % PROGRESS_EVERY == 0:
-                elapsed = time.time() - t0
-                _send_dm(
-                    f"Progress: {i:,}/{len(tx_hashes):,} receipts. "
-                    f"ok={receipts_ok:,} fail={receipts_fail:,} matches={len(matches):,}. "
-                    f"elapsed={elapsed:.1f}s"
-                )
+            if i % 200 == 0:
+                _send_dm(f"Progress: {i:,}/{len(tx_hashes):,} ok={ok:,} fail={fail:,} matches={len(matches):,} elapsed={time.time()-t0:.1f}s")
 
         matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
-        elapsed_total = time.time() - t0
-
-        header: List[str] = []
-        header.append("Scan finished")
-        header.append(f"Blocks: {blocks_back} (from {start} to {end})")
-        header.append(f"Transfer logs: {len(logs):,}")
-        header.append(f"Unique txs: {len(tx_hashes):,}")
-        header.append(f"Receipts ok: {receipts_ok:,}")
-        header.append(f"Receipts failed: {receipts_fail:,}")
-        header.append(f"Matches (>= {_fmt_usd_compact(min_usd)}): {len(matches):,}")
-        header.append(f"Time: {elapsed_total:.1f}s")
-
-        if not matches:
-            _send_dm("\n".join(header))
-            return
 
         lines: List[str] = []
-        lines.extend(header)
+        lines.append("Scan finished")
+        lines.append(f"Blocks: {blocks_back} (from {start} to {end})")
+        lines.append(f"Logs: {len(logs):,}")
+        lines.append(f"Unique txs: {len(tx_hashes):,}")
+        lines.append(f"Receipts ok: {ok:,}")
+        lines.append(f"Receipts failed: {fail:,}")
+        lines.append(f"Matches (>= {_fmt_usd_compact(min_usd)}): {len(matches):,}")
+        lines.append(f"Time: {time.time()-t0:.1f}s")
+
+        if not matches:
+            _send_dm("\n".join(lines))
+            return
+
+        state = _load_state()
+        usd_per_emoji = float(state["emoji_usd"]["buy"])
+
         lines.append("")
         lines.append("Top results (max 20):")
 
@@ -782,10 +811,7 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
 
         _send_dm("\n".join(lines))
 
-    try:
-        await asyncio.to_thread(_run_scan_sync)
-    except Exception as e:
-        await app.bot.send_message(chat_id=user_id, text=f"scan crashed: {e}")
+    await asyncio.to_thread(_run_scan_sync)
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -809,12 +835,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         blocks_back = 20000
 
     await update.message.reply_text(
-        f"Scanning last {blocks_back} blocks for buys >= {_fmt_usd_compact(min_usd)}. Check your DM for progress."
+        f"Scanning last {blocks_back} blocks for buys >= {_fmt_usd_compact(min_usd)}. Check your DM."
     )
 
-    asyncio.create_task(
-        _scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)
-    )
+    asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -828,13 +852,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     price, fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
     wp = _weth_price_usd()
 
-    # Cache token price and fdv when available
     if price is not None:
         cache["token_price_usd"] = float(price)
     if fdv is not None:
         cache["token_fdv"] = float(fdv)
 
-    # Fallback to cached values if API fails
     if price is None:
         price = cache.get("token_price_usd")
     if fdv is None:
@@ -881,25 +903,13 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("<b>🔥 Burned</b>")
     lines.append(f"{burned_bil:.2f}B CLAWD ({_fmt_int_usd(burned_usd)}) · {burned_pct:.2f}% of supply")
     lines.append("")
+    lines.append("")
 
-    try:
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        await update.message.reply_text(f"stats send failed: {e}")
-        await update.message.reply_text("\n".join([
-            "CLAWD stats (plain fallback)",
-            f"Current price: {_fmt_price(price) if price is not None else 'N/A'}",
-            f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}",
-            f"My Wallet: {CLAWD_WALLET}",
-            f"{_fmt_big(clawd_amt)} CLAWD ({_fmt_int_usd(clawd_usd)})",
-            f"{_fmt_weth_two(weth_amt)} WETH ({_fmt_int_usd(weth_usd)})",
-            f"Total value: {_fmt_int_usd(total_value)}",
-            f"Burned: {burned_bil:.2f}B CLAWD ({_fmt_int_usd(burned_usd)}) · {burned_pct:.2f}% of supply",
-        ]), disable_web_page_preview=True)
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 
 # =========================
@@ -910,11 +920,11 @@ def _eid(kind: str, tx_hash: str, log_index_hex: str) -> str:
     return f"{kind}:{tx_hash}:{log_index_hex}"
 
 
-def _monitor_tick_sync() -> List[Tuple[str, str]]:
-    """
-    Does all blocking RPC work sync.
-    Returns a list of (kind, caption) to send to Telegram.
-    """
+def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
+    global CANCEL_FLAG
+    if CANCEL_FLAG:
+        return []
+
     state = _load_state()
     latest = _get_latest_block()
     confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
@@ -937,16 +947,22 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
     seen_stake = set(state["watch"]["seen"].get("stake") or [])
     seen_burn = set(state["watch"]["seen"].get("burn") or [])
 
-    price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    # cache token price for buy sanity check and burn/stake USD
+    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    if price is not None:
+        state["cache"]["token_price_usd"] = float(price)
+    else:
+        price = state.get("cache", {}).get("token_price_usd")
+    _save_state(state)
+
     token_price = float(price) if price is not None else 0.0
 
     state_min = state["min_usd"]
-    state_emoji = state["emoji_usd"]
+
+    outgoing: List[Tuple[str, str, str]] = []  # (kind, caption, wallet_addr_for_link)
 
     txs_for_buy: List[str] = []
     tx_seen_local = set()
-
-    outgoing: List[Tuple[str, str]] = []
 
     for lg in logs:
         tx_hash = lg.get("transactionHash")
@@ -954,7 +970,7 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
 
         classified = _classify_transfer_log(lg)
         if classified and tx_hash:
-            kind, _from, _to, amount_int = classified
+            kind, from_addr, _to, amount_int = classified
             event_id = _eid(kind, tx_hash, log_index)
 
             if kind == "stake":
@@ -962,25 +978,8 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
                     amount = _dec(amount_int, TOKEN_DECIMALS)
                     usd = amount * token_price
                     if usd >= float(state_min["stake"]):
-                        bar = _emoji_bar(usd, float(state_emoji["stake"]))
-                        caption = (
-                            tx_url = f"https://basescan.org/tx/{tx_hash}"
-                            from_url = f"https://basescan.org/address/{_from}"
-                            emoji_line = bar
-
-                            caption = (
-                                "<b>CLAWD STAKED!</b>
-
-"
-                                f"{emoji_line}
-
-"
-                                f"CLAWD: {int(round(amount)):,} (<a href=\"{tx_url}\">Tx</a>)
-"
-                                f"Wallet: <a href=\"{from_url}\">{_short_addr(_from)}</a>"
-                            )
-)
-                        outgoing.append(("stake", caption))
+                        caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
+                        outgoing.append(("stake", caption, from_addr))
                     seen_stake.add(event_id)
 
             elif kind == "burn":
@@ -988,25 +987,8 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
                     amount = _dec(amount_int, TOKEN_DECIMALS)
                     usd = amount * token_price
                     if usd >= float(state_min["burn"]):
-                        bar = _emoji_bar(usd, float(state_emoji["burn"]))
-                        caption = (
-                            tx_url = f"https://basescan.org/tx/{tx_hash}"
-                            from_url = f"https://basescan.org/address/{_from}"
-                            emoji_line = bar
-
-                            caption = (
-                                "<b>CLAWD BURNED!</b>
-
-"
-                                f"{emoji_line}
-
-"
-                                f"CLAWD: {int(round(amount)):,} (<a href=\"{tx_url}\">Tx</a>)
-"
-                                f"Wallet: <a href=\"{from_url}\">{_short_addr(_from)}</a>"
-                            )
-)
-                        outgoing.append(("burn", caption))
+                        caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
+                        outgoing.append(("burn", caption, from_addr))
                     seen_burn.add(event_id)
 
         if tx_hash and tx_hash not in tx_seen_local:
@@ -1018,45 +1000,19 @@ def _monitor_tick_sync() -> List[Tuple[str, str]]:
         if buy_id in seen_buy:
             continue
 
+        # Only mark as seen after successful processing (avoid losing events on RPC hiccups)
         try:
             receipt = _get_receipt(h)
-        except Exception:
-            # Do not mark as seen so it can retry next tick
-            continue
-
-        try:
             buy = _buy_from_receipt(h, receipt)
             if buy:
                 usd = float(buy["usd"])
                 if usd >= float(state_min["buy"]):
                     tokens = float(buy["tokens"])
                     buyer = buy["buyer"]
-
-                    emoji_line = _emoji_bar(usd, float(state_emoji["buy"]))
-                    tx_url = f"https://basescan.org/tx/{h}"
-                    from_url = f"https://basescan.org/address/{buyer}"
-
-                    caption = (
-                        "<b>CLAWD BOUGHT!</b>
-
-"
-                        f"{emoji_line}
-
-"
-                        f"CLAWD: {int(round(tokens)):,} (<a href=\"{tx_url}\">Tx</a>)
-"
-                        f"Spent: {_fmt_usd_compact(usd)}
-"
-                        f"Wallet: <a href=\"{from_url}\">{_short_addr(buyer)}</a>"
-                    )
-
-                    outgoing.append(("buy", caption))
-
-            # Mark as seen only after successful processing
+                    caption = _event_caption("buy", h, tokens, usd, buyer)
+                    outgoing.append(("buy", caption, buyer))
             seen_buy.add(buy_id)
-
         except Exception:
-            # Do not mark as seen so it can retry next tick
             continue
 
     state["watch"]["last_scanned_block"] = end
@@ -1072,7 +1028,7 @@ async def monitor(app) -> None:
     while True:
         try:
             outgoing = await asyncio.to_thread(_monitor_tick_sync)
-            for kind, caption in outgoing:
+            for kind, caption, _wallet in outgoing:
                 await _send_photo_or_text(app, POST_CHAT_ID, kind, caption)
         except Exception:
             pass
@@ -1081,9 +1037,8 @@ async def monitor(app) -> None:
 
 
 async def post_init(app) -> None:
-    # Startup message (same idea as your example bot)
     try:
-        if POST_CHAT_ID == ADMIN_ID:
+        if ALLOWED_CHAT_ID == 0:
             await app.bot.send_message(chat_id=ADMIN_ID, text="CLAWD bot started (test mode). Use /help")
         else:
             await app.bot.send_message(chat_id=POST_CHAT_ID, text="CLAWD bot started. Use /help")
@@ -1097,21 +1052,6 @@ async def post_init(app) -> None:
 # Main
 # =========================
 
-
-# ===== Cancel Command =====
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    cancelled = 0
-    for task in list(TASK_REGISTRY.values()):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-
-    await update.message.reply_text(f"Cancelled {cancelled} task(s).")
-# ==========================
-
 def main() -> None:
     _ensure_data_dir()
 
@@ -1119,12 +1059,11 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("setmin", cmd_setmin))
     app.add_handler(CommandHandler("setemoji", cmd_setemoji))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
-
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
