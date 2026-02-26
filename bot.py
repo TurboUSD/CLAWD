@@ -915,7 +915,7 @@ def _eid(kind: str, tx_hash: str, log_index_hex: str) -> str:
 
 
 def _monitor_tick_sync() -> List[Tuple[str, str, str]]:
-            state = _load_state()
+    state = _load_state()
     latest = _get_latest_block()
     confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
     if confirmed_latest < 0:
