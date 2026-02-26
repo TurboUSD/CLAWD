@@ -668,12 +668,12 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("")
     lines.append("<b>🦞 My Wallet</b>")
     lines.append(wallet_html)
-    lines.append(f"{_fmt_big(clawd_amt)} CLAWD ≈ {_fmt_int_usd(clawd_usd)}")
-    lines.append(f"{_fmt_weth_two(weth_amt)} WETH ≈ {_fmt_int_usd(weth_usd)}")
+    lines.append(f"{_fmt_big(clawd_amt)} CLAWD ({_fmt_int_usd(clawd_usd)})")
+    lines.append(f"{_fmt_weth_two(weth_amt)} WETH ({_fmt_int_usd(weth_usd)})")
     lines.append(f"Total value: {_fmt_int_usd(total_value)}")
     lines.append("")
     lines.append("<b>🔥 Burned</b>")
-    lines.append(f"{burned_bil:.2f}B CLAWD ≈ {_fmt_int_usd(burned_usd)} · {burned_pct:.2f}% of supply")
+    lines.append(f"{burned_bil:.2f}B CLAWD ({_fmt_int_usd(burned_usd)}) · {burned_pct:.2f}% of supply")
     lines.append("")
 
     try:
@@ -705,113 +705,126 @@ def _eid(kind: str, tx_hash: str, log_index_hex: str) -> str:
     return f"{kind}:{tx_hash}:{log_index_hex}"
 
 
+def _monitor_tick_sync() -> List[Tuple[str, str]]:
+    """
+    Does all blocking RPC work sync.
+    Returns a list of (kind, caption) to send to Telegram.
+    """
+    state = _load_state()
+    latest = _get_latest_block()
+    confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
+    if confirmed_latest < 0:
+        confirmed_latest = 0
+
+    last_scanned = int(state["watch"].get("last_scanned_block") or 0)
+    if last_scanned <= 0:
+        start = max(0, confirmed_latest - 5)
+    else:
+        start = max(0, last_scanned - WATCH_OVERLAP_BLOCKS)
+
+    end = confirmed_latest
+    if end < start:
+        return []
+
+    logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
+
+    seen_buy = set(state["watch"]["seen"].get("buy") or [])
+    seen_stake = set(state["watch"]["seen"].get("stake") or [])
+    seen_burn = set(state["watch"]["seen"].get("burn") or [])
+
+    price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    token_price = float(price) if price is not None else 0.0
+
+    state_min = state["min_usd"]
+    state_emoji = state["emoji_usd"]
+
+    txs_for_buy: List[str] = []
+    tx_seen_local = set()
+
+    outgoing: List[Tuple[str, str]] = []
+
+    for lg in logs:
+        tx_hash = lg.get("transactionHash")
+        log_index = lg.get("logIndex", "0x0")
+
+        classified = _classify_transfer_log(lg)
+        if classified and tx_hash:
+            kind, _from, _to, amount_int = classified
+            event_id = _eid(kind, tx_hash, log_index)
+
+            if kind == "stake":
+                if event_id not in seen_stake:
+                    amount = _dec(amount_int, TOKEN_DECIMALS)
+                    usd = amount * token_price
+                    if usd >= float(state_min["stake"]):
+                        bar = _emoji_bar(usd, float(state_emoji["stake"]))
+                        caption = (
+                            f"{bar} {_fmt_usd_compact(usd)}\n"
+                            f"Amount: {int(round(amount)):,} CLAWD\n"
+                            f"Tx: https://basescan.org/tx/{tx_hash}"
+                        )
+                        outgoing.append(("stake", caption))
+                    seen_stake.add(event_id)
+
+            elif kind == "burn":
+                if event_id not in seen_burn:
+                    amount = _dec(amount_int, TOKEN_DECIMALS)
+                    usd = amount * token_price
+                    if usd >= float(state_min["burn"]):
+                        bar = _emoji_bar(usd, float(state_emoji["burn"]))
+                        caption = (
+                            f"{bar} {_fmt_usd_compact(usd)}\n"
+                            f"Amount: {int(round(amount)):,} CLAWD\n"
+                            f"Tx: https://basescan.org/tx/{tx_hash}"
+                        )
+                        outgoing.append(("burn", caption))
+                    seen_burn.add(event_id)
+
+        if tx_hash and tx_hash not in tx_seen_local:
+            tx_seen_local.add(tx_hash)
+            txs_for_buy.append(tx_hash)
+
+    for h in txs_for_buy:
+        buy_id = f"buy:{h}"
+        if buy_id in seen_buy:
+            continue
+
+        try:
+            receipt = _get_receipt(h)
+            buy = _buy_from_receipt(h, receipt)
+            if buy:
+                usd = float(buy["usd"])
+                if usd >= float(state_min["buy"]):
+                    bar = _emoji_bar(usd, float(state_emoji["buy"]))
+                    tokens = float(buy["tokens"])
+                    buyer = buy["buyer"]
+                    caption = (
+                        f"{bar} {_fmt_usd_compact(usd)}\n"
+                        f"Buyer: {buyer}\n"
+                        f"Tokens: {int(round(tokens)):,} CLAWD\n"
+                        f"Tx: https://basescan.org/tx/{h}"
+                    )
+                    outgoing.append(("buy", caption))
+        except Exception:
+            pass
+        finally:
+            seen_buy.add(buy_id)
+
+    state["watch"]["last_scanned_block"] = end
+    state["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
+    state["watch"]["seen"]["stake"] = _prune_seen(list(seen_stake))
+    state["watch"]["seen"]["burn"] = _prune_seen(list(seen_burn))
+    _save_state(state)
+
+    return outgoing
+
+
 async def monitor(app) -> None:
     while True:
         try:
-            state = _load_state()
-            latest = _get_latest_block()
-            confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
-            if confirmed_latest < 0:
-                confirmed_latest = 0
-
-            last_scanned = int(state["watch"].get("last_scanned_block") or 0)
-            if last_scanned <= 0:
-                start = max(0, confirmed_latest - 5)
-            else:
-                start = max(0, last_scanned - WATCH_OVERLAP_BLOCKS)
-
-            end = confirmed_latest
-            if end < start:
-                await asyncio.sleep(WATCH_POLL_SEC)
-                continue
-
-            logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
-
-            seen_buy = set(state["watch"]["seen"].get("buy") or [])
-            seen_stake = set(state["watch"]["seen"].get("stake") or [])
-            seen_burn = set(state["watch"]["seen"].get("burn") or [])
-
-            price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-            token_price = float(price) if price is not None else 0.0
-
-            state_min = state["min_usd"]
-            state_emoji = state["emoji_usd"]
-
-            txs_for_buy: List[str] = []
-            tx_seen_local = set()
-
-            for lg in logs:
-                tx_hash = lg.get("transactionHash")
-                log_index = lg.get("logIndex", "0x0")
-
-                classified = _classify_transfer_log(lg)
-                if classified and tx_hash:
-                    kind, _from, _to, amount_int = classified
-                    event_id = _eid(kind, tx_hash, log_index)
-
-                    if kind == "stake":
-                        if event_id not in seen_stake:
-                            amount = _dec(amount_int, TOKEN_DECIMALS)
-                            usd = amount * token_price
-                            if usd >= float(state_min["stake"]):
-                                bar = _emoji_bar(usd, float(state_emoji["stake"]))
-                                caption = (
-                                    f"{bar} {_fmt_usd_compact(usd)}\n"
-                                    f"Amount: {int(round(amount)):,} CLAWD\n"
-                                    f"Tx: https://basescan.org/tx/{tx_hash}"
-                                )
-                                await _send_photo_or_text(app, POST_CHAT_ID, "stake", caption)
-                            seen_stake.add(event_id)
-
-                    elif kind == "burn":
-                        if event_id not in seen_burn:
-                            amount = _dec(amount_int, TOKEN_DECIMALS)
-                            usd = amount * token_price
-                            if usd >= float(state_min["burn"]):
-                                bar = _emoji_bar(usd, float(state_emoji["burn"]))
-                                caption = (
-                                    f"{bar} {_fmt_usd_compact(usd)}\n"
-                                    f"Amount: {int(round(amount)):,} CLAWD\n"
-                                    f"Tx: https://basescan.org/tx/{tx_hash}"
-                                )
-                                await _send_photo_or_text(app, POST_CHAT_ID, "burn", caption)
-                            seen_burn.add(event_id)
-
-                if tx_hash and tx_hash not in tx_seen_local:
-                    tx_seen_local.add(tx_hash)
-                    txs_for_buy.append(tx_hash)
-
-            for h in txs_for_buy:
-                buy_id = f"buy:{h}"
-                if buy_id in seen_buy:
-                    continue
-                try:
-                    receipt = _get_receipt(h)
-                    buy = _buy_from_receipt(h, receipt)
-                    if buy:
-                        usd = float(buy["usd"])
-                        if usd >= float(state_min["buy"]):
-                            bar = _emoji_bar(usd, float(state_emoji["buy"]))
-                            tokens = float(buy["tokens"])
-                            buyer = buy["buyer"]
-                            caption = (
-                                f"{bar} {_fmt_usd_compact(usd)}\n"
-                                f"Buyer: {buyer}\n"
-                                f"Tokens: {int(round(tokens)):,} CLAWD\n"
-                                f"Tx: https://basescan.org/tx/{h}"
-                            )
-                            await _send_photo_or_text(app, POST_CHAT_ID, "buy", caption)
-                except Exception:
-                    pass
-                finally:
-                    seen_buy.add(buy_id)
-
-            state["watch"]["last_scanned_block"] = end
-            state["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
-            state["watch"]["seen"]["stake"] = _prune_seen(list(seen_stake))
-            state["watch"]["seen"]["burn"] = _prune_seen(list(seen_burn))
-            _save_state(state)
-
+            outgoing = await asyncio.to_thread(_monitor_tick_sync)
+            for kind, caption in outgoing:
+                await _send_photo_or_text(app, POST_CHAT_ID, kind, caption)
         except Exception:
             pass
 
