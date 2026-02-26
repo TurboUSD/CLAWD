@@ -884,7 +884,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
 
     lines: List[str] = []
-    lines.append("<b>🔍 CLAWD Stats</b>")
+    lines.append("<b>📊 CLAWD Stats</b>")
     lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
     lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
     lines.append("")
