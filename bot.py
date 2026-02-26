@@ -1,4 +1,3 @@
-```python
 import os
 import json
 import asyncio
@@ -11,7 +10,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 
 # =========================
-# Environment variables (same naming style as your existing bot)
+# Environment variables 
 # =========================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -818,4 +817,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
