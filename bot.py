@@ -1414,12 +1414,62 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_task(f"scan:{update.effective_user.id}", asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)))
 
 
+# Chainlink ETH/USD feed on Base Mainnet
+# Source: https://data.chain.link/feeds/base/base/eth-usd (Standard address on BaseScan)
+CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+
+# If you already have a working Base RPC URL (you do, since balances work), reuse it here.
+# Example:
+# BASE_RPC_URL = "https://rpc.ankr.com/base/<YOUR_ANKR_KEY>"
+# Or just point this to whatever you use in _erc20_balance_of
+BASE_RPC_URL = RPC_URL  # change if your variable name is different
+
+_SEL_DECIMALS = "0x313ce567"         # decimals()
+_SEL_LATEST_ROUND = "0xfeaf968c"     # latestRoundData()
+
+def _rpc_eth_call(to_addr: str, data_hex: str) -> str:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": to_addr, "data": data_hex}, "latest"],
+    }
+    r = requests.post(BASE_RPC_URL, json=payload, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
+    return j["result"]
+
+def _abi_int256(word_hex: str) -> int:
+    # word_hex is a 32 byte hex string like "0x" + 64 hex chars
+    x = int(word_hex, 16)
+    if x >= 1 << 255:
+        x -= 1 << 256
+    return x
+
 def _get_eth_price_now() -> float:
-    url = "https://api.dexscreener.com/latest/dex/pairs/base/0x4200000000000000000000000000000000000006"
+    """
+    Reads ETH/USD from Chainlink on Base via your Ankr Base RPC.
+    No Dexscreener dependency.
+    """
     try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        return float(data["pair"]["priceUsd"])
+        dec_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_DECIMALS)
+        decimals = int(dec_raw, 16)
+
+        lr_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_LATEST_ROUND)
+        if not lr_raw or lr_raw == "0x":
+            return 0.0
+
+        # latestRoundData() returns 5 words (32 bytes each). The answer is the 2nd word.
+        data = lr_raw[2:].rjust(64 * 5, "0")
+        answer_word = "0x" + data[64:128]
+        answer = _abi_int256(answer_word)
+
+        if answer <= 0:
+            return 0.0
+
+        return float(answer) / (10 ** decimals)
     except Exception:
         return 0.0
 
