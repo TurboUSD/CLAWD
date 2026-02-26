@@ -1006,6 +1006,26 @@ def _event_caption(kind: str, tx_hash: str, amount_tokens: float, usd: float, wa
     )
     return caption
 
+def _payment_line(kind: str, pay: dict | None) -> str:
+    if kind != "buy" or not pay:
+        return ""
+
+    parts = []
+
+    if pay.get("eth"):
+        parts.append(f"ETH: {pay['eth']:.2f}")
+
+    if pay.get("usdc"):
+        parts.append(f"USDC: {int(round(pay['usdc'])):,}")
+
+    if pay.get("usdt"):
+        parts.append(f"USDT: {int(round(pay['usdt'])):,}")
+
+    if not parts:
+        return ""
+
+    return "\n" + "\n".join(parts)
+
 
 async def _dm_user(app, user_id: int, text: str) -> bool:
     try:
