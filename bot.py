@@ -300,8 +300,8 @@ def _erc20_balance_of(token: str, holder: str) -> int:
     return int(out, 16)
 
 
-def _eth_call(to: str, data: str) -> str:
-    return _rpc("eth_call", [{"to": to, "data": data}, "latest"])
+def _eth_call(to: str, data: str, block_tag: str = "latest") -> str:
+    return _rpc("eth_call", [{"to": to, "data": data}, block_tag])
 
 
 def _chainlink_decimals(feed: str) -> int:
@@ -309,10 +309,11 @@ def _chainlink_decimals(feed: str) -> int:
     return int(out, 16)
 
 
-def _chainlink_latest_answer(feed: str) -> Optional[float]:
+def _chainlink_latest_answer(feed: str, block_number: Optional[int] = None) -> Optional[float]:
     try:
         dec = _chainlink_decimals(feed)
-        out = _eth_call(feed, "0xfeaf968c")  # latestRoundData()
+        block_tag = hex(block_number) if block_number is not None else "latest"
+        out = _eth_call(feed, "0xfeaf968c", block_tag=block_tag)  # latestRoundData()
         answer_int = int(out[2 + 64:2 + 128], 16)
         return answer_int / (10 ** dec)
     except Exception:
@@ -348,8 +349,8 @@ def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional
         return None, None
 
 
-def _weth_price_usd() -> Optional[float]:
-    v = _chainlink_latest_answer(CHAINLINK_ETH_USD_FEED)
+def _weth_price_usd(block_number: Optional[int] = None) -> Optional[float]:
+    v = _chainlink_latest_answer(CHAINLINK_ETH_USD_FEED, block_number=block_number)
     if v is not None and v > 0:
         return float(v)
     try:
@@ -422,6 +423,15 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     if _receipt_has_ignored_erc721(receipt):
         return None
 
+    # Use the receipt block number for historic Chainlink reads (eth_call at that block)
+    block_number = None
+    try:
+        bn_hex = receipt.get("blockNumber")
+        if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
+            block_number = int(bn_hex, 16)
+    except Exception:
+        block_number = None
+
     token_addresses = {
         TOKEN_ADDRESS: TOKEN_DECIMALS,
         USDC_ADDRESS: 6,
@@ -489,7 +499,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     # Fallback: WETH payer
     if spent_usd <= 0 and weth_out > 0 and payer_weth:
         payer = payer_weth
-        wp = _weth_price_usd() or 0.0
+        wp = _weth_price_usd(block_number=block_number) or 0.0
         spent_usd += _dec(max(0, -weth_del.get(payer, 0)), 18) * wp
 
     # Add native ETH value (tx.value) if present. This is the primary payment path for
@@ -502,7 +512,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
             # If we didn't already infer a payer from stable/WETH outflow, assume tx.from paid.
             if payer is None and tx_from:
                 payer = tx_from
-            wp = _weth_price_usd() or 0.0
+            wp = _weth_price_usd(block_number=block_number) or 0.0
             spent_usd += _dec(eth_value_int, 18) * wp
     except Exception:
         pass
@@ -555,6 +565,15 @@ def _pick_final_seller(token_deltas: Dict[str, int], exclude_addrs: List[str]) -
 def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _receipt_has_ignored_erc721(receipt):
         return None
+
+    # Use the receipt block number for historic Chainlink reads (eth_call at that block)
+    block_number = None
+    try:
+        bn_hex = receipt.get("blockNumber")
+        if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
+            block_number = int(bn_hex, 16)
+    except Exception:
+        block_number = None
 
     token_addresses = {
         TOKEN_ADDRESS: TOKEN_DECIMALS,
@@ -623,7 +642,7 @@ def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[s
     # Fallback: WETH inflow
     if got_usd <= 0 and weth_in > 0 and recv_weth:
         receiver = recv_weth
-        wp = _weth_price_usd() or 0.0
+        wp = _weth_price_usd(block_number=block_number) or 0.0
         got_usd += _dec(max(0, weth_del.get(receiver, 0)), 18) * wp
 
     # Add ETH received only if tx.to is seller? Hard to do reliably. Skip to avoid false positives.
