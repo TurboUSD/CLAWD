@@ -339,10 +339,15 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     }
 
     deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
-    tdel = deltas[_norm(TOKEN_ADDRESS)]
+
+    tx = _get_tx(tx_hash)
+    tx_from = _norm(tx.get("from", ""))
+
+    tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
     if not tdel:
         return None
 
+    # Exclusions for receiver fallback
     exclude = [
         TOKEN_ADDRESS,
         USDC_ADDRESS,
@@ -352,39 +357,54 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         STAKING_CONTRACT_ADDRESS,
     ]
 
-    buyer = _pick_final_buyer(tdel, exclude)
+    # Buyer resolution
+    buyer = tx_from if tx_from else _pick_final_buyer(tdel, exclude)
     if not buyer:
         return None
-    if tdel.get(buyer, 0) <= 0:
-        return None
 
-    usdc_out = max(0, -deltas[_norm(USDC_ADDRESS)].get(buyer, 0))
-    usdt_out = max(0, -deltas[_norm(USDT_ADDRESS)].get(buyer, 0))
-    weth_out = max(0, -deltas[_norm(WETH_ADDRESS)].get(buyer, 0))
+    # Tokens received
+    tokens_delta_int = int(tdel.get(buyer, 0))
+    if tokens_delta_int <= 0:
+        # Fallback to max receiver of CLAWD
+        buyer2 = _pick_final_buyer(tdel, exclude)
+        if not buyer2:
+            return None
+        buyer = buyer2
+        tokens_delta_int = int(tdel.get(buyer, 0))
+        if tokens_delta_int <= 0:
+            return None
 
-    tx = _get_tx(tx_hash)
-    tx_from = _norm(tx.get("from", ""))
+    tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
+
+    # USD spent by tx.from (payer), not by token receiver
+    payer = tx_from if tx_from else buyer
+
+    usdc_out = max(0, -(deltas.get(_norm(USDC_ADDRESS)) or {}).get(payer, 0))
+    usdt_out = max(0, -(deltas.get(_norm(USDT_ADDRESS)) or {}).get(payer, 0))
+    weth_out = max(0, -(deltas.get(_norm(WETH_ADDRESS)) or {}).get(payer, 0))
+
     eth_value_int = int(tx.get("value", "0x0"), 16)
-    eth_out = eth_value_int if tx_from == buyer else 0
-
-    total_usd = 0.0
-    total_usd += _dec(usdc_out, 6)
-    total_usd += _dec(usdt_out, 6)
 
     wp = _weth_price_usd() or 0.0
-    total_usd += (_dec(weth_out, 18) + _dec(eth_out, 18)) * wp
+    spent_usd = 0.0
+    spent_usd += _dec(usdc_out, 6)
+    spent_usd += _dec(usdt_out, 6)
+    spent_usd += (_dec(weth_out, 18) + _dec(eth_value_int, 18)) * wp
+
+    # USD estimated from received tokens
+    price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    est_usd = (float(price) if price is not None else 0.0) * float(tokens_bought)
+
+    total_usd = max(spent_usd, est_usd)
 
     if total_usd <= 0:
         return None
-
-    tokens_bought = _dec(tdel[buyer], TOKEN_DECIMALS)
 
     return {
         "buyer": buyer,
         "usd": float(total_usd),
         "tokens": float(tokens_bought),
     }
-
 
 # =========================
 # Stake and burn detection
@@ -662,7 +682,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
 
     lines: List[str] = []
-    lines.append("<b>🔍 $CLAWD Treasury</b>")
+    lines.append("<b>🔍 CLAWD Stats</b>")
     lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
     lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
     lines.append("")
