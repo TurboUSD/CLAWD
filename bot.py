@@ -122,12 +122,14 @@ def _receipt_has_ignored_erc721(receipt: Dict[str, Any]) -> bool:
 # =========================
 
 TASK_REGISTRY: Dict[str, asyncio.Task] = {}
+TASK_CANCEL_EVENTS: Dict[str, asyncio.Event] = {}
 
 def _track_task(name: str, task: asyncio.Task) -> asyncio.Task:
     TASK_REGISTRY[name] = task
 
     def _cleanup(_t: asyncio.Task) -> None:
         TASK_REGISTRY.pop(name, None)
+        TASK_CANCEL_EVENTS.pop(name, None)
 
     task.add_done_callback(_cleanup)
     return task
@@ -310,7 +312,7 @@ def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
 
 def _rpc(method: str, params: List[Any]) -> Any:
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(BASE_RPC_URL, json=payload, timeout=25)
+    r = requests.post(BASE_RPC_URL, json=payload, timeout=12)
     r.raise_for_status()
     j = r.json()
     if "error" in j:
@@ -1292,6 +1294,33 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cancelled = 0
     had_monitor = False
 
+    # Signal cancellation for any cooperative workers
+    for name, ev in list(TASK_CANCEL_EVENTS.items()):
+        try:
+            ev.set()
+        except Exception:
+            pass
+
+    for name, task in list(TASK_REGISTRY.items()):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+            if name == "monitor":
+                had_monitor = True
+
+    await update.message.reply_text(f"Cancelled {cancelled} task(s).")
+
+    if had_monitor:
+        try:
+            _track_task("monitor", asyncio.create_task(monitor(context.application)))
+            await update.message.reply_text("Monitor restarted.")
+        except Exception:
+            pass
+
+
+    cancelled = 0
+    had_monitor = False
+
     for name, task in list(TASK_REGISTRY.items()):
         if not task.done():
             task.cancel()
@@ -1668,47 +1697,74 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
 
-    # Parse args like: /burned 7d
-    days = 7
-    if context.args:
-        arg = (context.args[0] or "").strip().lower()
-        m = re.match(r"^(\d+)(d)?$", arg)
-        if m:
-            try:
-                days = int(m.group(1))
-            except Exception:
-                days = 7
-
-    days = max(1, min(60, days))
-
-    # Reply immediately so the command never looks "stuck"
+async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int, status_msg_id: int, cancel_ev: asyncio.Event) -> None:
+    # Cooperative cancellation + non-blocking RPC calls (threaded)
+    chat_id = update.message.chat_id if update.message else None
     try:
-        await update.message.reply_text(f"Building burned chart for last {days}d...")
+        now_ts = int(time.time())
 
-        latest = _get_latest_block()
+        latest = await asyncio.to_thread(_get_latest_block)
         end_block = latest - max(0, WATCH_CONFIRMATIONS)
         if end_block < 0:
             end_block = 0
 
-        # Fast approximate range based on blocks/day (avoids slow timestamp search)
         start_block = _approx_start_block(end_block, days)
 
         to_topic = "0x" + _norm(BURN_ADDRESS).replace("0x", "").rjust(64, "0")
-        logs = _get_logs_chunked_topics(
-            TOKEN_ADDRESS,
-            start_block,
-            end_block,
-            [TRANSFER_TOPIC0, None, to_topic],
-        )
 
+        # Pull logs in small chunks to avoid RPC timeouts
+        cur = start_block
+        all_logs: List[Dict[str, Any]] = []
+        chunk_size = max(500, int(RPC_LOG_CHUNK))
+        # Progress edit every few chunks
+        chunks_done = 0
+
+        while cur <= end_block:
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError()
+
+            end = min(end_block, cur + chunk_size - 1)
+            params = [{
+                "fromBlock": hex(cur),
+                "toBlock": hex(end),
+                "address": TOKEN_ADDRESS,
+                "topics": [TRANSFER_TOPIC0, None, to_topic],
+            }]
+            try:
+                chunk = await asyncio.to_thread(_rpc, "eth_getLogs", params)
+            except Exception:
+                # If RPC fails, try smaller chunk once
+                if chunk_size > 500:
+                    chunk_size = max(500, chunk_size // 2)
+                    continue
+                chunk = []
+
+            if chunk:
+                all_logs.extend(chunk)
+
+            cur = end + 1
+            chunks_done += 1
+
+            if chunks_done % 6 == 0 and chat_id is not None:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg_id,
+                        text=f"Building burned chart for last {days}d... scanned up to block {end}/{end_block}",
+                    )
+                except Exception:
+                    pass
+
+        # Aggregate burns by day
         by_day: Dict[str, int] = defaultdict(int)
         ts_cache: Dict[int, int] = {}
 
-        for lg in logs:
+        # Fetch timestamps for unique blocks only
+        for lg in all_logs:
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError()
+
             bn_hex = lg.get("blockNumber")
             if not isinstance(bn_hex, str) or not bn_hex.startswith("0x"):
                 continue
@@ -1716,7 +1772,10 @@ async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
             ts = ts_cache.get(bn)
             if ts is None:
-                ts = int(_get_block_timestamp(bn) or 0)
+                try:
+                    ts = int(await asyncio.to_thread(_get_block_timestamp, bn) or 0)
+                except Exception:
+                    ts = 0
                 ts_cache[bn] = ts
 
             data_hex = lg.get("data") or "0x0"
@@ -1748,14 +1807,13 @@ async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         x = list(range(len(days_list)))
         fig, ax = plt.subplots(figsize=(10, 5))
 
-        bars = ax.bar(x, daily_tokens, color="#d62728")  # red
+        bars = ax.bar(x, daily_tokens, color="#d62728")
         ax.set_title(f"CLAWD Burned per day (last {days}d)")
         ax.set_xlabel("Day (UTC)")
         ax.set_ylabel("Burned per day (CLAWD)")
         ax.set_xticks(x)
         ax.set_xticklabels([d[5:] for d in days_list], rotation=45, ha="right")
 
-        # Rounded labels on each bar (no decimals)
         for b in bars:
             h = float(b.get_height())
             if h <= 0:
@@ -1772,10 +1830,9 @@ async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
 
         ax2 = ax.twinx()
-        ax2.plot(x, cumulative, color="#111111", linewidth=2)  # near-black
+        ax2.plot(x, cumulative, color="#111111", linewidth=2)
         ax2.set_ylabel("Cumulative (CLAWD)")
 
-        # Rounded label only for the last cumulative point
         if cumulative:
             last_x = x[-1]
             last_y = float(cumulative[-1])
@@ -1806,8 +1863,60 @@ async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         with open(out_path, "rb") as f:
             await update.message.reply_photo(photo=f, caption=msg, parse_mode="HTML")
 
+        # Clean up status message
+        if chat_id is not None:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+            except Exception:
+                pass
+
+    except asyncio.CancelledError:
+        if update.message:
+            try:
+                await update.message.reply_text("Cancelled.")
+            except Exception:
+                pass
+        raise
     except Exception as e:
-        await update.message.reply_text(f"Failed to build burned chart: {e}")
+        if update.message:
+            await update.message.reply_text(f"Failed to build burned chart: {e}")
+
+
+async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    days = 7
+    if context.args:
+        arg = (context.args[0] or "").strip().lower()
+        m = re.match(r"^(\d+)(d)?$", arg)
+        if m:
+            try:
+                days = int(m.group(1))
+            except Exception:
+                days = 7
+
+    days = max(1, min(60, days))
+
+    status = await update.message.reply_text(f"Building burned chart for last {days}d...")
+
+    # Cancel any existing task first
+    for name, ev in list(TASK_CANCEL_EVENTS.items()):
+        try:
+            ev.set()
+        except Exception:
+            pass
+    for name, task in list(TASK_REGISTRY.items()):
+        if not task.done():
+            task.cancel()
+
+    name = f"burned:{update.message.chat_id}"
+    cancel_ev = asyncio.Event()
+    TASK_CANCEL_EVENTS[name] = cancel_ev
+
+    task = asyncio.create_task(_run_burned_task(update, context, days, status.message_id, cancel_ev))
+    _track_task(name, task)
+
 
 # =========================
 # Watcher
