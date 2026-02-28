@@ -70,6 +70,7 @@ else:
 
 TOKEN_ADDRESS = os.environ.get("TOKEN_CONTRACT_ADDRESS", "0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07").strip()
 TOKEN_DECIMALS = int(os.environ.get("TOKEN_DECIMALS", "18"))
+TOTAL_SUPPLY = float(os.environ.get("TOTAL_SUPPLY", "100000000000"))
 
 CLAWD_WALLET = os.environ.get("CLAWD_WALLET_ADDRESS", "0x90eF2A9211A3E7CE788561E5af54C76B0Fa3aEd0").strip()
 BURN_ADDRESS = os.environ.get("BURN_ADDRESS", "0x000000000000000000000000000000000000dEaD").strip()
@@ -247,7 +248,8 @@ def _load_burned_cache() -> Dict[str, Any]:
     c.setdefault("token", TOKEN_ADDRESS)
     c.setdefault("burn_address", BURN_ADDRESS)
     c.setdefault("decimals", TOKEN_DECIMALS)
-    c.setdefault("last_scanned_block", 0)
+    c.setdefault("min_scanned_block", 0)
+    c.setdefault("max_scanned_block", 0)
     c.setdefault("days", {})
     if not isinstance(c["days"], dict):
         c["days"] = {}
@@ -1764,7 +1766,9 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
 
         cache = _load_burned_cache()
         cache_days = cache.get("days") or {}
-        cache_last = int(cache.get("last_scanned_block") or 0)
+
+        cache_min = int(cache.get("min_scanned_block") or 0)
+        cache_max = int(cache.get("max_scanned_block") or 0)
 
         latest = await asyncio.to_thread(_get_latest_block)
         end_block = latest - max(0, WATCH_CONFIRMATIONS)
@@ -1773,74 +1777,88 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
 
         start_block = _approx_start_block(end_block, days)
 
-        # If cache is behind, only scan missing blocks; if cache is ahead or empty, scan the range needed
-        scan_from = max(start_block, cache_last + 1) if cache_last > 0 else start_block
-        if scan_from > end_block:
-            scan_from = end_block + 1
+        # Determine which block ranges must be scanned to cover the requested window.
+        # We keep a min and max scanned block in cache to support both backfill and incremental updates.
+        ranges: List[Tuple[int, int]] = []
 
+        if cache_min <= 0 or cache_max <= 0:
+            ranges.append((start_block, end_block))
+            cache_min = start_block
+            cache_max = end_block
+        else:
+            if start_block < cache_min:
+                ranges.append((start_block, cache_min - 1))
+                cache_min = start_block
+            if end_block > cache_max:
+                ranges.append((cache_max + 1, end_block))
+                cache_max = end_block
         to_topic = "0x" + _norm(BURN_ADDRESS).replace("0x", "").rjust(64, "0")
 
         # Pull logs in small chunks to avoid RPC timeouts
-        cur = scan_from
         all_logs: List[Dict[str, Any]] = []
         chunk_size = max(500, int(RPC_LOG_CHUNK))
-        # Progress edit every few chunks
         chunks_done = 0
 
-        while cur <= end_block:
-            if cancel_ev.is_set():
-                raise asyncio.CancelledError()
+        for r_start, r_end in ranges:
+            if r_start > r_end:
+                continue
 
-            end = min(end_block, cur + chunk_size - 1)
-            params = [{
-                "fromBlock": hex(cur),
-                "toBlock": hex(end),
-                "address": TOKEN_ADDRESS,
-                "topics": [TRANSFER_TOPIC0, None, to_topic],
-            }]
-            try:
-                chunk = await asyncio.to_thread(_rpc, "eth_getLogs", params)
-            except Exception:
-                # If RPC fails, try smaller chunk once
-                if chunk_size > 500:
-                    chunk_size = max(500, chunk_size // 2)
-                    continue
-                chunk = []
+            cur = r_start
+            while cur <= r_end:
+                if cancel_ev.is_set():
+                    raise asyncio.CancelledError()
 
-            if chunk:
-                all_logs.extend(chunk)
-
-            cur = end + 1
-            chunks_done += 1
-
-            if chunks_done % 6 == 0 and chat_id is not None:
+                end = min(r_end, cur + chunk_size - 1)
+                params = [{
+                    "fromBlock": hex(cur),
+                    "toBlock": hex(end),
+                    "address": TOKEN_ADDRESS,
+                    "topics": [TRANSFER_TOPIC0, None, to_topic],
+                }]
                 try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=status_msg_id,
-                        text=f"Building burned chart for last {days}d... scanned up to block {end}/{end_block}",
-                    )
+                    chunk = await asyncio.to_thread(_rpc, "eth_getLogs", params)
                 except Exception:
-                    pass
+                    # If RPC fails, try smaller chunk
+                    if chunk_size > 500:
+                        chunk_size = max(500, chunk_size // 2)
+                        continue
+                    chunk = []
 
-        # Aggregate burns by day (raw ints)
-        by_day: Dict[str, int] = defaultdict(int)
+                if chunk:
+                    all_logs.extend(chunk)
 
-        # Preload from cache for the requested window
+                cur = end + 1
+                chunks_done += 1
+
+                if chunks_done % 6 == 0 and chat_id is not None:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=status_msg_id,
+                            text=f"Building burned chart for last {days}d... scanned up to block {end}/{end_block}",
+                        )
+                    except Exception:
+                        pass
+        # Aggregate burns by day (raw ints), using cache as the source of truth.
         requested_days: List[str] = []
+        requested_set = set()
         for i in range(days - 1, -1, -1):
-            requested_days.append(_ymd_utc_from_ts(now_ts - i * 86400))
+            d = _ymd_utc_from_ts(now_ts - i * 86400)
+            requested_days.append(d)
+            requested_set.add(d)
 
+        def _cache_day_int(day: str) -> int:
+            v = cache_days.get(day, {}).get("burned_raw")
+            try:
+                return int(v) if v is not None else 0
+            except Exception:
+                return 0
+
+        by_day: Dict[str, int] = {}
         for d in requested_days:
-            v = cache_days.get(d, {}).get("burned_raw")
-            if v is not None:
-                try:
-                    by_day[d] = int(v)
-                except Exception:
-                    pass
+            by_day[d] = _cache_day_int(d)
 
         # Map logs to UTC day with only 2 block timestamp RPC calls (fast).
-        # Using per-log eth_getBlockByNumber is too slow and can appear "stuck".
         min_bn = None
         max_bn = None
         for lg in all_logs:
@@ -1853,7 +1871,6 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                     max_bn = bn
 
         ts_a = 0
-        ts_b = 0
         spb = 2.0  # seconds per block fallback
 
         if min_bn is not None and max_bn is not None:
@@ -1866,7 +1883,6 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                         spb = 2.0
             except Exception:
                 ts_a = 0
-                ts_b = 0
 
         for lg in all_logs:
             if cancel_ev.is_set():
@@ -1877,7 +1893,6 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                 continue
             bn = int(bn_hex, 16)
 
-            # Estimate timestamp for this block
             if min_bn is not None and ts_a > 0:
                 ts = int(ts_a + (bn - min_bn) * spb)
             else:
@@ -1892,13 +1907,20 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                 continue
 
             day = time.strftime("%Y-%m-%d", time.gmtime(ts))
-            by_day[day] += amt_int
-            cache_days[day] = {"burned_raw": str(by_day[day])}
+
+            prev = _cache_day_int(day)
+            new_total = prev + amt_int
+            cache_days[day] = {"burned_raw": str(new_total)}
+
+            if day in requested_set:
+                by_day[day] = new_total
+
         # Persist cache progress
-        if scan_from <= end_block:
-            cache["last_scanned_block"] = max(cache_last, end_block)
-            cache["days"] = cache_days
-            _save_burned_cache(cache)
+        cache["min_scanned_block"] = int(cache_min)
+        cache["max_scanned_block"] = int(cache_max)
+        cache["days"] = cache_days
+        _save_burned_cache(cache)
+
 
         days_list: List[str] = []
         daily_tokens: List[float] = []
@@ -1918,12 +1940,18 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         x = list(range(len(days_list)))
         fig, ax = plt.subplots(figsize=(10, 5))
 
-        bars = ax.bar(x, daily_tokens, color="#d62728")
+        bars = ax.bar(x, daily_tokens, width=0.55, color="#d62728")
         ax.set_title(f"CLAWD Burned per day (last {days}d)")
         ax.set_xlabel("Day (UTC)")
         ax.set_ylabel("Burned per day (CLAWD)")
         ax.set_xticks(x)
         ax.set_xticklabels([d[5:] for d in days_list], rotation=45, ha="right")
+
+        max_daily = max([float(v) for v in daily_tokens], default=0.0)
+        if max_daily > 0:
+            ax.set_ylim(0, max_daily * 1.25)
+
+        ax.ticklabel_format(style="plain", axis="y", useOffset=False)
 
         for b in bars:
             h = float(b.get_height())
@@ -1943,6 +1971,7 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         ax2 = ax.twinx()
         ax2.plot(x, cumulative, color="#111111", linewidth=2)
         ax2.set_ylabel("Cumulative (CLAWD)")
+        ax2.ticklabel_format(style="plain", axis="y", useOffset=False)
 
         if cumulative:
             last_x = x[-1]
@@ -1957,7 +1986,6 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                 fontsize=9,
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#111111", lw=1),
             )
-
         fig.tight_layout()
 
         try:
@@ -1970,7 +1998,8 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         plt.close(fig)
 
         total_burned_period = cumulative[-1] if cumulative else 0.0
-        msg = f"<b>🔥 Burned last {days}d</b>\nTotal: {_fmt_num(total_burned_period)} CLAWD"
+        burned_pct_supply = (float(total_burned_period) / float(TOTAL_SUPPLY) * 100.0) if float(TOTAL_SUPPLY) > 0 else 0.0
+        msg = f"<b>🔥 Burned last {days}d</b>\nTotal: {_fmt_num(total_burned_period)} CLAWD ({burned_pct_supply:.2f}% of supply)"
         with open(out_path, "rb") as f:
             await update.message.reply_photo(photo=f, caption=msg, parse_mode="HTML")
 
