@@ -8,6 +8,7 @@ import requests
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
@@ -352,6 +353,16 @@ def _fmt_compact_int(n: float) -> str:
 def _fmt_num(n: float) -> str:
     # Alias used by /burned output
     return _fmt_compact_int(n)
+
+
+def _fmt_axis_millions(x, pos):
+    try:
+        v = float(x)
+    except Exception:
+        return "0"
+    if v == 0:
+        return "0"
+    return f"{int(round(v / 1_000_000.0))}M"
 def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
     if usd_per_emoji <= 0:
         usd_per_emoji = 100.0
@@ -1951,7 +1962,7 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         if max_daily > 0:
             ax.set_ylim(0, max_daily * 1.25)
 
-        ax.ticklabel_format(style="plain", axis="y", useOffset=False)
+        ax.yaxis.set_major_formatter(FuncFormatter(_fmt_axis_millions))
 
         for b in bars:
             h = float(b.get_height())
@@ -1971,7 +1982,7 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         ax2 = ax.twinx()
         ax2.plot(x, cumulative, color="#111111", linewidth=2)
         ax2.set_ylabel("Cumulative (CLAWD)")
-        ax2.ticklabel_format(style="plain", axis="y", useOffset=False)
+        ax2.yaxis.set_major_formatter(FuncFormatter(_fmt_axis_millions))
 
         if cumulative:
             last_x = x[-1]
