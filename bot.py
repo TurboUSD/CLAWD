@@ -213,6 +213,59 @@ def _save_state(state: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
+
+# =========================
+# Burned cache (per day)
+# =========================
+
+BURNED_CACHE_FILENAME = os.environ.get("BURNED_CACHE_FILENAME", "burned_cache.json").strip()
+
+def _burned_cache_path() -> str:
+    try:
+        os.makedirs(DATA_PATH, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(DATA_PATH, BURNED_CACHE_FILENAME)
+
+def _load_burned_cache() -> Dict[str, Any]:
+    path = _burned_cache_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            c = json.load(f)
+    except Exception:
+        c = {}
+
+    if not isinstance(c, dict):
+        c = {}
+
+    # Reset cache if it belongs to another token/burn addr
+    if _norm(str(c.get("token", ""))) not in ("", _norm(TOKEN_ADDRESS)):
+        c = {}
+    if _norm(str(c.get("burn_address", ""))) not in ("", _norm(BURN_ADDRESS)):
+        c = {}
+
+    c.setdefault("token", TOKEN_ADDRESS)
+    c.setdefault("burn_address", BURN_ADDRESS)
+    c.setdefault("decimals", TOKEN_DECIMALS)
+    c.setdefault("last_scanned_block", 0)
+    c.setdefault("days", {})
+    if not isinstance(c["days"], dict):
+        c["days"] = {}
+    return c
+
+def _save_burned_cache(cache: Dict[str, Any]) -> None:
+    path = _burned_cache_path()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+def _ymd_utc_from_ts(ts: int) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
+
 def _prune_seen(arr: List[str]) -> List[str]:
     if len(arr) <= WATCH_MAX_SEEN_EVENTS:
         return arr
@@ -292,6 +345,11 @@ def _fmt_compact_int(n: float) -> str:
     return str(int(round(v)))
 
 
+
+
+def _fmt_num(n: float) -> str:
+    # Alias used by /burned output
+    return _fmt_compact_int(n)
 def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
     if usd_per_emoji <= 0:
         usd_per_emoji = 100.0
@@ -1704,6 +1762,10 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
     try:
         now_ts = int(time.time())
 
+        cache = _load_burned_cache()
+        cache_days = cache.get("days") or {}
+        cache_last = int(cache.get("last_scanned_block") or 0)
+
         latest = await asyncio.to_thread(_get_latest_block)
         end_block = latest - max(0, WATCH_CONFIRMATIONS)
         if end_block < 0:
@@ -1711,10 +1773,15 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
 
         start_block = _approx_start_block(end_block, days)
 
+        # If cache is behind, only scan missing blocks; if cache is ahead or empty, scan the range needed
+        scan_from = max(start_block, cache_last + 1) if cache_last > 0 else start_block
+        if scan_from > end_block:
+            scan_from = end_block + 1
+
         to_topic = "0x" + _norm(BURN_ADDRESS).replace("0x", "").rjust(64, "0")
 
         # Pull logs in small chunks to avoid RPC timeouts
-        cur = start_block
+        cur = scan_from
         all_logs: List[Dict[str, Any]] = []
         chunk_size = max(500, int(RPC_LOG_CHUNK))
         # Progress edit every few chunks
@@ -1756,8 +1823,22 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                 except Exception:
                     pass
 
-        # Aggregate burns by day
+        # Aggregate burns by day (raw ints)
         by_day: Dict[str, int] = defaultdict(int)
+
+        # Preload from cache for the requested window
+        requested_days: List[str] = []
+        for i in range(days - 1, -1, -1):
+            requested_days.append(_ymd_utc_from_ts(now_ts - i * 86400))
+
+        for d in requested_days:
+            v = cache_days.get(d, {}).get("burned_raw")
+            if v is not None:
+                try:
+                    by_day[d] = int(v)
+                except Exception:
+                    pass
+
         ts_cache: Dict[int, int] = {}
 
         # Fetch timestamps for unique blocks only
@@ -1788,6 +1869,13 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
 
             day = time.strftime("%Y-%m-%d", time.gmtime(ts))
             by_day[day] += amt_int
+            cache_days[day] = {"burned_raw": str(by_day[day])}
+
+        # Persist cache progress
+        if scan_from <= end_block:
+            cache["last_scanned_block"] = max(cache_last, end_block)
+            cache["days"] = cache_days
+            _save_burned_cache(cache)
 
         days_list: List[str] = []
         daily_tokens: List[float] = []
