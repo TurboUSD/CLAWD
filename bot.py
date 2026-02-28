@@ -69,6 +69,11 @@ TOKEN_DECIMALS = int(os.environ.get("TOKEN_DECIMALS", "18"))
 CLAWD_WALLET = os.environ.get("CLAWD_WALLET_ADDRESS", "0x90eF2A9211A3E7CE788561E5af54C76B0Fa3aEd0").strip()
 BURN_ADDRESS = os.environ.get("BURN_ADDRESS", "0x000000000000000000000000000000000000dEaD").strip()
 
+INCINERATOR_ADDRESS = os.environ.get(
+    "INCINERATOR_ADDRESS",
+    "0x536453350F2EeE2EB8bFeE1866bAF4fCa494A092"
+).strip()
+
 STAKING_CONTRACT_ADDRESS = os.environ.get("STAKING_CONTRACT_ADDRESS", "").strip()
 
 USDC_ADDRESS = os.environ.get("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
@@ -297,6 +302,20 @@ def _rpc(method: str, params: List[Any]) -> Any:
     return j["result"]
 
 
+def _get_code(addr: str, block_tag: str = "latest") -> str:
+    return _rpc("eth_getCode", [addr, block_tag])
+
+
+def _is_contract(addr: str, block_number: Optional[int] = None) -> bool:
+    try:
+        tag = hex(int(block_number)) if block_number is not None else "latest"
+        code = _get_code(addr, tag)
+        return isinstance(code, str) and code not in ("0x", "0x0", "")
+    except Exception:
+        # If in doubt, do not classify as contract here
+        return False
+
+
 def _get_latest_block() -> int:
     return _hex_to_int(_rpc("eth_blockNumber", []))
 
@@ -326,6 +345,26 @@ def _get_logs_chunked(address: str, from_block: int, to_block: int) -> List[Dict
             "toBlock": hex(end),
             "address": address,
             "topics": [TRANSFER_TOPIC0],
+        }])
+        all_logs.extend(chunk or [])
+        cur = end + 1
+
+    return all_logs
+
+
+def _get_logs_chunked_topics(address: str, from_block: int, to_block: int, topics: List[Optional[str]]) -> List[Dict[str, Any]]:
+    all_logs: List[Dict[str, Any]] = []
+    if from_block > to_block:
+        return all_logs
+
+    cur = from_block
+    while cur <= to_block:
+        end = min(to_block, cur + max(1, RPC_LOG_CHUNK) - 1)
+        chunk = _rpc("eth_getLogs", [{
+            "fromBlock": hex(cur),
+            "toBlock": hex(end),
+            "address": address,
+            "topics": topics,
         }])
         all_logs.extend(chunk or [])
         cur = end + 1
@@ -401,6 +440,35 @@ def _get_block_timestamp(block_number: int) -> Optional[int]:
     except Exception:
         return None
     return None
+
+
+def _find_block_by_timestamp(target_ts: int, latest_block: int) -> int:
+    """Binary search the first block whose timestamp is >= target_ts."""
+    lo = 0
+    hi = max(0, latest_block)
+
+    ts_cache: Dict[int, int] = {}
+
+    def _ts(bn: int) -> int:
+        if bn in ts_cache:
+            return ts_cache[bn]
+        t = _get_block_timestamp(bn)
+        if t is None:
+            t = 0
+        ts_cache[bn] = int(t)
+        return ts_cache[bn]
+
+    if _ts(hi) < target_ts:
+        return hi
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _ts(mid) >= target_ts:
+            hi = mid
+        else:
+            lo = mid + 1
+
+    return lo
 
 
 def _load_eth_price_cache() -> Dict[str, float]:
@@ -763,6 +831,10 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
     if not buyer:
         return None
 
+    # If final receiver is a contract, it is not a personal buy
+    if _is_contract(buyer, block_number):
+        return None
+
     tokens_delta_int = int(tdel.get(buyer, 0))
     if tokens_delta_int <= 0:
         return None
@@ -826,6 +898,17 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         if usdc_out > 0 or usdt_out > 0:
             payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
             if payer:
+                # If tx.from is an EOA, require payer == tx.from (prevents sells tagged as buys)
+                # If tx.from is a contract (relayer/router), allow payer != tx.from but require payer to be an EOA
+                if tx_from:
+                    if not _is_contract(tx_from, block_number):
+                        if _norm(payer) != _norm(tx_from):
+                            return None
+                    else:
+                        # Relayed transaction: payer must not be a contract
+                        if _is_contract(payer, block_number):
+                            return None
+
                 usdc_spent = _dec(max(0, -usdc_del.get(payer, 0)), 6)
                 usdt_spent = _dec(max(0, -usdt_del.get(payer, 0)), 6)
                 spent_usd = usdc_spent + usdt_spent
@@ -833,6 +916,18 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         # Fallback: WETH path
         if spent_usd <= 0 and weth_out > 0 and payer_weth:
             payer = payer_weth
+
+            # If tx.from is an EOA, require payer == tx.from (prevents sells tagged as buys)
+            # If tx.from is a contract (relayer/router), allow payer != tx.from but require payer to be an EOA
+            if tx_from:
+                if not _is_contract(tx_from, block_number):
+                    if _norm(payer) != _norm(tx_from):
+                        return None
+                else:
+                    # Relayed transaction: payer must not be a contract
+                    if _is_contract(payer, block_number):
+                        return None
+
             wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False)
             if wp is None or wp <= 0:
                 return None
@@ -840,10 +935,8 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
             spent_usd = weth_spent * float(wp)
             eth_spent_total = weth_spent
 
-        # Require real payment outflow. This avoids false positives like LP withdrawals
-    # where the wallet receives both TOKEN and stables in the same tx.
-    if spent_usd <= 0:
-        return None
+        if spent_usd <= 0:
+            return None
 
     total_usd = spent_usd
 
@@ -1499,6 +1592,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         clawd_bal_int = _erc20_balance_of(TOKEN_ADDRESS, CLAWD_WALLET)
         weth_bal_int = _erc20_balance_of(WETH_ADDRESS, CLAWD_WALLET)
         burned_bal_int = _erc20_balance_of(TOKEN_ADDRESS, BURN_ADDRESS)
+        incinerator_bal_int = _erc20_balance_of(TOKEN_ADDRESS, INCINERATOR_ADDRESS)
     except Exception as e:
         await update.message.reply_text(f"Failed to read balances from RPC: {e}")
         return
@@ -1506,16 +1600,20 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clawd_amt = _dec(clawd_bal_int, TOKEN_DECIMALS)
     weth_amt = _dec(weth_bal_int, 18)
     burned_amt = _dec(burned_bal_int, TOKEN_DECIMALS)
+    incinerator_amt = _dec(incinerator_bal_int, TOKEN_DECIMALS)
 
     clawd_usd = (float(price or 0.0)) * clawd_amt
     weth_usd = (float(wp or 0.0)) * weth_amt
     burned_usd = (float(price or 0.0)) * burned_amt
+    incinerator_usd = (float(price or 0.0)) * incinerator_amt
 
     total_value = clawd_usd + weth_usd
 
     total_supply = 100_000_000_000.0
     burned_pct = (burned_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
     burned_bil = burned_amt / 1_000_000_000.0
+    incinerator_pct = (incinerator_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
+    incinerator_bil = incinerator_amt / 1_000_000_000.0
 
     wallet_link = f"https://basescan.org/address/{CLAWD_WALLET}"
     wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
@@ -1533,6 +1631,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("")
     lines.append("<b>🔥 Burned</b>")
     lines.append(f"{burned_bil:.2f}B CLAWD ({_fmt_int_usd(burned_usd)}) · {burned_pct:.2f}% of supply")
+    lines.append(f"({incinerator_bil:.2f}B CLAWD pending in the incinerator · {incinerator_pct:.2f}% of supply)")
     lines.append("")
     lines.append("")
 
@@ -1541,6 +1640,163 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
         disable_web_page_preview=True
     )
+
+
+async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    # Parse args like: /burned 7d
+    days = 7
+    if context.args:
+        arg = (context.args[0] or "").strip().lower()
+        m = re.match(r"^(\d+)(d)?$", arg)
+        if m:
+            try:
+                days = int(m.group(1))
+            except Exception:
+                days = 7
+
+    days = max(1, min(60, days))
+
+    try:
+        latest = _get_latest_block()
+        end_block = latest - max(0, WATCH_CONFIRMATIONS)
+        if end_block < 0:
+            end_block = 0
+
+        now_ts = int(time.time())
+        start_ts = now_ts - days * 86400
+        start_block = _find_block_by_timestamp(start_ts, end_block)
+
+        to_topic = "0x" + _norm(BURN_ADDRESS).replace("0x", "").rjust(64, "0")
+        logs = _get_logs_chunked_topics(
+            TOKEN_ADDRESS,
+            start_block,
+            end_block,
+            [TRANSFER_TOPIC0, None, to_topic],
+        )
+
+        by_day: Dict[str, int] = defaultdict(int)
+        ts_cache: Dict[int, int] = {}
+
+        for lg in logs:
+            bn_hex = lg.get("blockNumber")
+            if not isinstance(bn_hex, str) or not bn_hex.startswith("0x"):
+                continue
+            bn = int(bn_hex, 16)
+
+            ts = ts_cache.get(bn)
+            if ts is None:
+                ts = int(_get_block_timestamp(bn) or 0)
+                ts_cache[bn] = ts
+
+            data_hex = lg.get("data") or "0x0"
+            try:
+                amt_int = int(data_hex, 16)
+            except Exception:
+                amt_int = 0
+            if amt_int <= 0:
+                continue
+
+            day = time.strftime("%Y-%m-%d", time.gmtime(ts))
+            by_day[day] += amt_int
+
+        days_list: List[str] = []
+        daily_tokens: List[float] = []
+
+        for i in range(days - 1, -1, -1):
+            day_ts = now_ts - i * 86400
+            day = time.strftime("%Y-%m-%d", time.gmtime(day_ts))
+            days_list.append(day)
+            daily_tokens.append(_dec(by_day.get(day, 0), TOKEN_DECIMALS))
+
+        cumulative: List[float] = []
+        running = 0.0
+        for v in daily_tokens:
+            running += float(v)
+            cumulative.append(running)
+
+        import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+def _fmt_compact_int(n: float) -> str:
+    v = float(n)
+    av = abs(v)
+    if av >= 1_000_000_000:
+        return f"{int(round(v / 1_000_000_000.0))}B"
+    if av >= 1_000_000:
+        return f"{int(round(v / 1_000_000.0))}M"
+    if av >= 1_000:
+        return f"{int(round(v / 1_000.0))}K"
+    return str(int(round(v)))
+
+x = list(range(len(days_list)))
+fig, ax = plt.subplots(figsize=(10, 5))
+
+# Bars: daily burned
+bars = ax.bar(x, daily_tokens, color="#d62728")  # red
+ax.set_title(f"CLAWD Burned per day (last {days}d)")
+ax.set_xlabel("Day (UTC)")
+ax.set_ylabel("Burned per day (CLAWD)")
+ax.set_xticks(x)
+ax.set_xticklabels([d[5:] for d in days_list], rotation=45, ha="right")
+
+# Rounded labels on each bar
+for i, b in enumerate(bars):
+    h = float(b.get_height())
+    if h <= 0:
+        continue
+    ax.annotate(
+        _fmt_compact_int(h),
+        (b.get_x() + b.get_width() / 2.0, h),
+        xytext=(0, 6),
+        textcoords="offset points",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", lw=1),
+    )
+
+# Line: cumulative burned
+ax2 = ax.twinx()
+ax2.plot(x, cumulative, color="#111111", linewidth=2)  # near-black
+ax2.set_ylabel("Cumulative (CLAWD)")
+
+# Label only the last cumulative point
+if cumulative:
+    last_x = x[-1]
+    last_y = float(cumulative[-1])
+    ax2.annotate(
+        _fmt_compact_int(last_y),
+        (last_x, last_y),
+        xytext=(10, 0),
+        textcoords="offset points",
+        ha="left",
+        va="center",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#111111", lw=1),
+    )
+
+fig.tight_layout()
+
+        try:
+            os.makedirs(DATA_PATH, exist_ok=True)
+        except Exception:
+            pass
+
+        out_path = os.path.join(DATA_PATH, f"burned_{days}d.png")
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+        total_burned_period = cumulative[-1] if cumulative else 0.0
+        msg = f"<b>🔥 Burned last {days}d</b>\nTotal: {_fmt_num(total_burned_period)} CLAWD"
+        with open(out_path, "rb") as f:
+            await update.message.reply_photo(photo=f, caption=msg, parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(f"Failed to build burned chart: {e}")
 
 
 # =========================
@@ -1719,6 +1975,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setemoji", cmd_setemoji))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("burned", cmd_burned))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
