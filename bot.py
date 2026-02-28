@@ -5,6 +5,10 @@ import asyncio
 import time
 import calendar
 import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
 
@@ -272,6 +276,17 @@ def _fmt_usd_compact(x: float) -> str:
     if x >= 1_000:
         return f"${x/1_000:.2f}K"
     return f"${x:.2f}"
+
+def _fmt_compact_int(n: float) -> str:
+    v = float(n)
+    av = abs(v)
+    if av >= 1_000_000_000:
+        return f"{int(round(v / 1_000_000_000.0))}B"
+    if av >= 1_000_000:
+        return f"{int(round(v / 1_000_000.0))}M"
+    if av >= 1_000:
+        return f"{int(round(v / 1_000.0))}K"
+    return str(int(round(v)))
 
 
 def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
@@ -1717,69 +1732,52 @@ async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             running += float(v)
             cumulative.append(running)
 
-        import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+        x = list(range(len(days_list)))
+        fig, ax = plt.subplots(figsize=(10, 5))
 
-def _fmt_compact_int(n: float) -> str:
-    v = float(n)
-    av = abs(v)
-    if av >= 1_000_000_000:
-        return f"{int(round(v / 1_000_000_000.0))}B"
-    if av >= 1_000_000:
-        return f"{int(round(v / 1_000_000.0))}M"
-    if av >= 1_000:
-        return f"{int(round(v / 1_000.0))}K"
-    return str(int(round(v)))
+        bars = ax.bar(x, daily_tokens, color="#d62728")  # red
+        ax.set_title(f"CLAWD Burned per day (last {days}d)")
+        ax.set_xlabel("Day (UTC)")
+        ax.set_ylabel("Burned per day (CLAWD)")
+        ax.set_xticks(x)
+        ax.set_xticklabels([d[5:] for d in days_list], rotation=45, ha="right")
 
-x = list(range(len(days_list)))
-fig, ax = plt.subplots(figsize=(10, 5))
+        # Rounded labels on each bar (no decimals)
+        for b in bars:
+            h = float(b.get_height())
+            if h <= 0:
+                continue
+            ax.annotate(
+                _fmt_compact_int(h),
+                (b.get_x() + b.get_width() / 2.0, h),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", lw=1),
+            )
 
-# Bars: daily burned
-bars = ax.bar(x, daily_tokens, color="#d62728")  # red
-ax.set_title(f"CLAWD Burned per day (last {days}d)")
-ax.set_xlabel("Day (UTC)")
-ax.set_ylabel("Burned per day (CLAWD)")
-ax.set_xticks(x)
-ax.set_xticklabels([d[5:] for d in days_list], rotation=45, ha="right")
+        ax2 = ax.twinx()
+        ax2.plot(x, cumulative, color="#111111", linewidth=2)  # near-black
+        ax2.set_ylabel("Cumulative (CLAWD)")
 
-# Rounded labels on each bar
-for i, b in enumerate(bars):
-    h = float(b.get_height())
-    if h <= 0:
-        continue
-    ax.annotate(
-        _fmt_compact_int(h),
-        (b.get_x() + b.get_width() / 2.0, h),
-        xytext=(0, 6),
-        textcoords="offset points",
-        ha="center",
-        va="bottom",
-        fontsize=9,
-        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", lw=1),
-    )
+        # Rounded label only for the last cumulative point
+        if cumulative:
+            last_x = x[-1]
+            last_y = float(cumulative[-1])
+            ax2.annotate(
+                _fmt_compact_int(last_y),
+                (last_x, last_y),
+                xytext=(10, 0),
+                textcoords="offset points",
+                ha="left",
+                va="center",
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#111111", lw=1),
+            )
 
-# Line: cumulative burned
-ax2 = ax.twinx()
-ax2.plot(x, cumulative, color="#111111", linewidth=2)  # near-black
-ax2.set_ylabel("Cumulative (CLAWD)")
-
-# Label only the last cumulative point
-if cumulative:
-    last_x = x[-1]
-    last_y = float(cumulative[-1])
-    ax2.annotate(
-        _fmt_compact_int(last_y),
-        (last_x, last_y),
-        xytext=(10, 0),
-        textcoords="offset points",
-        ha="left",
-        va="center",
-        fontsize=9,
-        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#111111", lw=1),
-    )
-
-fig.tight_layout()
+        fig.tight_layout()
 
         try:
             os.makedirs(DATA_PATH, exist_ok=True)
@@ -1797,7 +1795,6 @@ fig.tight_layout()
 
     except Exception as e:
         await update.message.reply_text(f"Failed to build burned chart: {e}")
-
 
 # =========================
 # Watcher
