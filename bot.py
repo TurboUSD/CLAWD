@@ -1839,9 +1839,35 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                 except Exception:
                     pass
 
-        ts_cache: Dict[int, int] = {}
+        # Map logs to UTC day with only 2 block timestamp RPC calls (fast).
+        # Using per-log eth_getBlockByNumber is too slow and can appear "stuck".
+        min_bn = None
+        max_bn = None
+        for lg in all_logs:
+            bn_hex = lg.get("blockNumber")
+            if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
+                bn = int(bn_hex, 16)
+                if min_bn is None or bn < min_bn:
+                    min_bn = bn
+                if max_bn is None or bn > max_bn:
+                    max_bn = bn
 
-        # Fetch timestamps for unique blocks only
+        ts_a = 0
+        ts_b = 0
+        spb = 2.0  # seconds per block fallback
+
+        if min_bn is not None and max_bn is not None:
+            try:
+                ts_a = int(await asyncio.to_thread(_get_block_timestamp, int(min_bn)) or 0)
+                ts_b = int(await asyncio.to_thread(_get_block_timestamp, int(max_bn)) or 0)
+                if ts_a > 0 and ts_b > 0 and max_bn > min_bn:
+                    spb = (ts_b - ts_a) / float(max_bn - min_bn)
+                    if spb <= 0:
+                        spb = 2.0
+            except Exception:
+                ts_a = 0
+                ts_b = 0
+
         for lg in all_logs:
             if cancel_ev.is_set():
                 raise asyncio.CancelledError()
@@ -1851,13 +1877,11 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
                 continue
             bn = int(bn_hex, 16)
 
-            ts = ts_cache.get(bn)
-            if ts is None:
-                try:
-                    ts = int(await asyncio.to_thread(_get_block_timestamp, bn) or 0)
-                except Exception:
-                    ts = 0
-                ts_cache[bn] = ts
+            # Estimate timestamp for this block
+            if min_bn is not None and ts_a > 0:
+                ts = int(ts_a + (bn - min_bn) * spb)
+            else:
+                ts = now_ts
 
             data_hex = lg.get("data") or "0x0"
             try:
@@ -1870,7 +1894,6 @@ async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, d
             day = time.strftime("%Y-%m-%d", time.gmtime(ts))
             by_day[day] += amt_int
             cache_days[day] = {"burned_raw": str(by_day[day])}
-
         # Persist cache progress
         if scan_from <= end_block:
             cache["last_scanned_block"] = max(cache_last, end_block)
