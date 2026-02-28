@@ -47,6 +47,7 @@ WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
 WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
 WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
 RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))
+BLOCKS_PER_DAY = int(os.environ.get("BLOCKS_PER_DAY", "43200"))  # Base ~2s blocks
 
 DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else "/app/data")
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
@@ -333,6 +334,16 @@ def _is_contract(addr: str, block_number: Optional[int] = None) -> bool:
 
 def _get_latest_block() -> int:
     return _hex_to_int(_rpc("eth_blockNumber", []))
+
+def _approx_start_block(end_block: int, days: int) -> int:
+    # Approximate block range to avoid expensive timestamp binary search.
+    # Base blocks are ~2 seconds, ~43,200 blocks/day.
+    try:
+        bpd = max(1000, int(BLOCKS_PER_DAY))
+    except Exception:
+        bpd = 43200
+    return max(0, int(end_block) - int(days) * bpd)
+
 
 
 def _get_receipt(tx_hash: str) -> Dict[str, Any]:
@@ -1674,15 +1685,17 @@ async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     days = max(1, min(60, days))
 
+    # Reply immediately so the command never looks "stuck"
     try:
+        await update.message.reply_text(f"Building burned chart for last {days}d...")
+
         latest = _get_latest_block()
         end_block = latest - max(0, WATCH_CONFIRMATIONS)
         if end_block < 0:
             end_block = 0
 
-        now_ts = int(time.time())
-        start_ts = now_ts - days * 86400
-        start_block = _find_block_by_timestamp(start_ts, end_block)
+        # Fast approximate range based on blocks/day (avoids slow timestamp search)
+        start_block = _approx_start_block(end_block, days)
 
         to_topic = "0x" + _norm(BURN_ADDRESS).replace("0x", "").rjust(64, "0")
         logs = _get_logs_chunked_topics(
