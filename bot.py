@@ -1757,7 +1757,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("")
     lines.append("<b>🔥 Burned</b>")
     lines.append(
-        f"{burned_bil:.2f}B {TOKEN_SYMBOL} "
+        f"{burned_bil:.2f}B CLAWD "
         f"({_fmt_int_usd(burned_usd)} · {burned_pct:.2f}%)"
     )
     lines.append(
