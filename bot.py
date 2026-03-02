@@ -1568,81 +1568,93 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_id = update.effective_user.id
 
-    # Mode 1: scan a single transaction hash and, if it's a BUY, send the same buy alert.
+    # Mode 1: scan a single transaction hash and send the corresponding alert (buy/stake/burn).
     if len(context.args) == 1:
         tx_hash = context.args[0].strip()
-        if re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
-            await update.message.reply_text("Scanning tx hash...")
-            try:
-                receipt = _get_receipt(tx_hash)
-                if not receipt:
-                    await update.message.reply_text("Transaction not found (no receipt).")
-                    return
-            except Exception:
-                await update.message.reply_text("Failed to fetch receipt for this tx.")
+
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+            await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>  OR  /scan <tx_hash>")
+            return
+
+        await update.message.reply_text("Scanning tx hash...")
+
+        try:
+            receipt = _get_receipt(tx_hash)
+            if not receipt:
+                await update.message.reply_text("Transaction not found (no receipt).")
                 return
+        except Exception:
+            await update.message.reply_text("Failed to fetch receipt for this tx.")
+            return
 
-buy = None
-try:
-    buy = _buy_from_receipt(tx_hash, receipt)
-except Exception:
-    buy = None
+        # 1) Try BUY
+        buy = None
+        try:
+            buy = _buy_from_receipt(tx_hash, receipt)
+        except Exception:
+            buy = None
 
-if buy:
-    caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]), pay=buy.get("pay"))
-    await _send_photo_or_text(context.application, user_id, "buy", caption)
-    await update.message.reply_text("Buy alert sent in DM.")
-    return
+        if buy:
+            caption = _event_caption(
+                "buy",
+                tx_hash,
+                float(buy["tokens"]),
+                float(buy["usd"]),
+                str(buy["buyer"]),
+                pay=buy.get("pay"),
+            )
+            await _send_photo_or_text(context.application, user_id, "buy", caption)
+            await update.message.reply_text("Buy alert sent in DM.")
+            return
 
-# If it's not a buy, try stake/burn based on Transfer logs.
-# For /scan <tx_hash>, we send alerts regardless of your min_usd thresholds.
-try:
-    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+        # 2) If not a buy, try stake/burn based on Transfer logs.
+        # For /scan <tx_hash>, we send alerts regardless of your min_usd thresholds.
+        try:
+            price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
 
-    if price is None:
-        st = _load_state()
-        cache = st.get("cache") or {}
-        price = cache.get("token_price_usd")
-    token_price = float(price or 0.0)
+            if price is None:
+                st = _load_state()
+                cache = st.get("cache") or {}
+                price = cache.get("token_price_usd")
 
-    detected: List[str] = []
+            token_price = float(price or 0.0)
 
-    for lg in (receipt.get("logs") or []):
-        classified = _classify_transfer_log(lg)
-        if not classified:
-            continue
+            detected: List[str] = []
 
-        kind, from_addr, _to_addr, amount_int = classified
-        if kind not in ("stake", "burn"):
-            continue
+            for lg in (receipt.get("logs") or []):
+                classified = _classify_transfer_log(lg)
+                if not classified:
+                    continue
 
-        amount = _dec(amount_int, TOKEN_DECIMALS)
-        usd = amount * token_price
+                kind, from_addr, _to_addr, amount_int = classified
+                if kind not in ("stake", "burn"):
+                    continue
 
-        caption = _event_caption(kind, tx_hash, float(amount), float(usd), str(from_addr))
-        await _send_photo_or_text(context.application, user_id, kind, caption)
-        detected.append(kind)
+                amount = _dec(amount_int, TOKEN_DECIMALS)
+                usd = amount * token_price
 
-    if detected:
-        kinds = ", ".join(sorted(set(detected)))
-        await update.message.reply_text(f"{kinds.capitalize()} alert sent in DM.")
-        return
-except Exception:
-    pass
+                caption = _event_caption(kind, tx_hash, float(amount), float(usd), str(from_addr))
+                await _send_photo_or_text(context.application, user_id, kind, caption)
+                detected.append(kind)
 
-# Optional: detect if it's a sell, just to report correctly
-try:
-    sell = _sell_from_receipt(tx_hash, receipt)
-except Exception:
-    sell = None
+            if detected:
+                kinds = ", ".join(sorted(set(detected)))
+                await update.message.reply_text(f"{kinds.capitalize()} alert sent in DM.")
+                return
+        except Exception:
+            pass
 
-if sell:
-    await update.message.reply_text("That tx looks like a SELL. This command only sends alerts for buys.")
-else:
-    await update.message.reply_text("That tx is not detected as a buy, stake, or burn (no alert sent).")
-return
+        # Optional: detect if it's a sell, just to report correctly
+        sell = None
+        try:
+            sell = _sell_from_receipt(tx_hash, receipt)
+        except Exception:
+            sell = None
 
-        await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>  OR  /scan <tx_hash>")
+        if sell:
+            await update.message.reply_text("That tx looks like a SELL. This command only sends alerts for buys.")
+        else:
+            await update.message.reply_text("That tx is not detected as a buy, stake, or burn (no alert sent).")
         return
 
     # Mode 2: scan a block range for buys
@@ -1666,7 +1678,10 @@ return
         f"Scanning last {blocks_back} blocks for buys >= {_fmt_usd_compact(min_usd)}. Check your DM."
     )
 
-    _track_task(f"scan:{update.effective_user.id}", asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)))
+    _track_task(
+        f"scan:{update.effective_user.id}",
+        asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)),
+    )
 
 
 CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
