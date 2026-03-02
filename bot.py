@@ -1758,9 +1758,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("<b>🔥 Burned</b>")
     lines.append("🔥 Burned")
     lines.append(
-        f"{_fmt_compact(burned_tokens)} {TOKEN_SYMBOL} · "
-        f"${_fmt_usd_compact(burned_usd)} · "
-        f"{burned_pct:.2f}%"
+        f"{_fmt_compact(burned_tokens)} {TOKEN_SYMBOL} "
+        f"(${_fmt_usd_compact(burned_usd)} · {burned_pct:.2f}%)"
     )
     lines.append(
         f"(+{_fmt_compact(incinerator_tokens)} pending · "
