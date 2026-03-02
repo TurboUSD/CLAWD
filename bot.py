@@ -2129,19 +2129,37 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
             if kind == "stake":
                 if event_id not in seen_stake:
                     amount = _dec(amount_int, TOKEN_DECIMALS)
+
+                    # If we cannot price the token right now, do not mark as seen.
+                    # This avoids permanently losing stake alerts due to temporary price feed hiccups.
+                    if token_price <= 0.0:
+                        continue
+
                     usd = amount * token_price
                     if usd >= float(state_min["stake"]):
                         caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
                         outgoing.append(("stake", event_id, caption, from_addr))
+
+                    # Mark as seen only when we had a valid price.
+                    # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
                     seen_stake.add(event_id)
 
             elif kind == "burn":
                 if event_id not in seen_burn:
                     amount = _dec(amount_int, TOKEN_DECIMALS)
+
+                    # If we cannot price the token right now, do not mark as seen.
+                    # This avoids permanently losing burn alerts due to temporary price feed hiccups.
+                    if token_price <= 0.0:
+                        continue
+
                     usd = amount * token_price
                     if usd >= float(state_min["burn"]):
                         caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
                         outgoing.append(("burn", event_id, caption, from_addr))
+
+                    # Mark as seen only when we had a valid price.
+                    # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
                     seen_burn.add(event_id)
 
         if tx_hash and tx_hash not in tx_seen_local:
