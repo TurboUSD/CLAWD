@@ -73,8 +73,6 @@ TOKEN_ADDRESS = os.environ.get("TOKEN_CONTRACT_ADDRESS", "0x9f86dB9fc6f7c9408e8F
 TOKEN_DECIMALS = int(os.environ.get("TOKEN_DECIMALS", "18"))
 TOTAL_SUPPLY = float(os.environ.get("TOTAL_SUPPLY", "100000000000"))
 
-
-TOKEN_SYMBOL = os.environ.get("TOKEN_SYMBOL", "CLAWD").strip()
 CLAWD_WALLET = os.environ.get("CLAWD_WALLET_ADDRESS", "0x90eF2A9211A3E7CE788561E5af54C76B0Fa3aEd0").strip()
 BURN_ADDRESS = os.environ.get("BURN_ADDRESS", "0x000000000000000000000000000000000000dEaD").strip()
 
@@ -1758,9 +1756,13 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"Total value: {_fmt_int_usd(total_value)}")
     lines.append("")
     lines.append("<b>🔥 Burned</b>")
-    lines.append(f"{burned_bil:.2f}B CLAWD ({_fmt_int_usd(burned_usd)}) · {burned_pct:.2f}% of supply")
-    lines.append(f"({incinerator_bil:.2f}B CLAWD pending in the incinerator · {incinerator_pct:.2f}% of supply)")
-    lines.append("")
+    lines.append(
+        f"{burned_bil:.2f}B CLAWD "
+        f"({_fmt_int_usd(burned_usd)} · {burned_pct:.2f}%)"
+    )
+    lines.append(
+        f"(+{incinerator_bil:.2f}B pending · {incinerator_pct:.2f}%)"
+    )
     lines.append("")
 
     await update.message.reply_text(
@@ -2130,34 +2132,38 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
 
             if kind == "stake":
                 if event_id not in seen_stake:
-                    # If price feed fails (token_price=0), do not mark as seen.
-                    # We'll retry next tick so we don't lose real events.
-                    if token_price <= 0:
+                    amount = _dec(amount_int, TOKEN_DECIMALS)
+
+                    # If we cannot price the token right now, do not mark as seen.
+                    # This avoids permanently losing stake alerts due to temporary price feed hiccups.
+                    if token_price <= 0.0:
                         continue
 
-                    amount = _dec(amount_int, TOKEN_DECIMALS)
                     usd = amount * token_price
                     if usd >= float(state_min["stake"]):
                         caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
                         outgoing.append(("stake", event_id, caption, from_addr))
 
-                    # Price was available, so mark as seen even if below min to avoid spam retries.
+                    # Mark as seen only when we had a valid price.
+                    # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
                     seen_stake.add(event_id)
 
             elif kind == "burn":
                 if event_id not in seen_burn:
-                    # If price feed fails (token_price=0), do not mark as seen.
-                    # We'll retry next tick so we don't lose real burns.
-                    if token_price <= 0:
+                    amount = _dec(amount_int, TOKEN_DECIMALS)
+
+                    # If we cannot price the token right now, do not mark as seen.
+                    # This avoids permanently losing burn alerts due to temporary price feed hiccups.
+                    if token_price <= 0.0:
                         continue
 
-                    amount = _dec(amount_int, TOKEN_DECIMALS)
                     usd = amount * token_price
                     if usd >= float(state_min["burn"]):
                         caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
                         outgoing.append(("burn", event_id, caption, from_addr))
 
-                    # Price was available, so mark as seen even if below min to avoid spam retries.
+                    # Mark as seen only when we had a valid price.
+                    # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
                     seen_burn.add(event_id)
 
         if tx_hash and tx_hash not in tx_seen_local:
