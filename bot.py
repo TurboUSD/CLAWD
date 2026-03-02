@@ -1582,29 +1582,65 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text("Failed to fetch receipt for this tx.")
                 return
 
-            buy = None
-            try:
-                buy = _buy_from_receipt(tx_hash, receipt)
-            except Exception:
-                buy = None
+buy = None
+try:
+    buy = _buy_from_receipt(tx_hash, receipt)
+except Exception:
+    buy = None
 
-            if buy:
-                caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]), pay=buy.get("pay"))
-                await _send_photo_or_text(context.application, user_id, "buy", caption)
-                await update.message.reply_text("Buy alert sent in DM.")
-                return
+if buy:
+    caption = _event_caption("buy", tx_hash, float(buy["tokens"]), float(buy["usd"]), str(buy["buyer"]), pay=buy.get("pay"))
+    await _send_photo_or_text(context.application, user_id, "buy", caption)
+    await update.message.reply_text("Buy alert sent in DM.")
+    return
 
-            # Optional: detect if it's a sell, just to report correctly
-            try:
-                sell = _sell_from_receipt(tx_hash, receipt)
-            except Exception:
-                sell = None
+# If it's not a buy, try stake/burn based on Transfer logs.
+# For /scan <tx_hash>, we send alerts regardless of your min_usd thresholds.
+try:
+    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
 
-            if sell:
-                await update.message.reply_text("That tx looks like a SELL. This command only sends alerts for buys.")
-            else:
-                await update.message.reply_text("That tx is not detected as a buy (no alert sent).")
-            return
+    if price is None:
+        st = _load_state()
+        cache = st.get("cache") or {}
+        price = cache.get("token_price_usd")
+    token_price = float(price or 0.0)
+
+    detected: List[str] = []
+
+    for lg in (receipt.get("logs") or []):
+        classified = _classify_transfer_log(lg)
+        if not classified:
+            continue
+
+        kind, from_addr, _to_addr, amount_int = classified
+        if kind not in ("stake", "burn"):
+            continue
+
+        amount = _dec(amount_int, TOKEN_DECIMALS)
+        usd = amount * token_price
+
+        caption = _event_caption(kind, tx_hash, float(amount), float(usd), str(from_addr))
+        await _send_photo_or_text(context.application, user_id, kind, caption)
+        detected.append(kind)
+
+    if detected:
+        kinds = ", ".join(sorted(set(detected)))
+        await update.message.reply_text(f"{kinds.capitalize()} alert sent in DM.")
+        return
+except Exception:
+    pass
+
+# Optional: detect if it's a sell, just to report correctly
+try:
+    sell = _sell_from_receipt(tx_hash, receipt)
+except Exception:
+    sell = None
+
+if sell:
+    await update.message.reply_text("That tx looks like a SELL. This command only sends alerts for buys.")
+else:
+    await update.message.reply_text("That tx is not detected as a buy, stake, or burn (no alert sent).")
+return
 
         await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>  OR  /scan <tx_hash>")
         return
