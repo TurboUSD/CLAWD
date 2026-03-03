@@ -893,7 +893,7 @@ def _max_outflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], 
     return best_addr, best_out
 
 
-def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_fallback: bool = False) -> Optional[Dict[str, Any]]:
     if _receipt_has_ignored_erc721(receipt):
         return None
 
@@ -989,7 +989,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
         paid_with_eth = True
         payer = tx_from or buyer
         eth_spent_total = _dec(eth_value_int, 18)
-        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False)
+        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback)
         if wp is None or wp <= 0:
             return None
         spent_usd = eth_spent_total * float(wp)
@@ -1028,7 +1028,7 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[st
                     if _is_contract(payer, block_number):
                         return None
 
-            wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False)
+            wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback)
             if wp is None or wp <= 0:
                 return None
             weth_spent = _dec(max(0, -weth_del.get(payer, 0)), 18)
@@ -1161,7 +1161,7 @@ def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[s
     # Fallback: WETH inflow
     if got_usd <= 0 and weth_in > 0 and recv_weth:
         receiver = recv_weth
-        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
+        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback) or 0.0
         got_usd += _dec(max(0, weth_del.get(receiver, 0)), 18) * wp
 
     # Add ETH received only if tx.to is seller? Hard to do reliably. Skip to avoid false positives.
@@ -1538,7 +1538,7 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
             try:
                 receipt = _get_receipt(h)
                 ok += 1
-                buy = _buy_from_receipt(h, receipt)
+                buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
                 if buy and float(buy["usd"]) >= min_usd:
                     matches.append((h, buy))
             except Exception:
@@ -2255,15 +2255,33 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
         # Only mark as seen after successful processing (avoid losing events on RPC hiccups)
         try:
             receipt = _get_receipt(h)
-            buy = _buy_from_receipt(h, receipt)
+
+            # For realtime monitoring, allow a live ETH/USD fallback if historical pricing is unavailable.
+            buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
             if buy:
                 usd = float(buy["usd"])
                 if usd >= float(state_min["buy"]):
                     tokens = float(buy["tokens"])
                     buyer = buy["buyer"]
-                    caption = _event_caption("buy", h, tokens, usd, buyer, float(buy.get("eth", 0.0)))
+                    caption = _event_caption("buy", h, tokens, usd, buyer, pay=buy.get("pay"))
                     outgoing.append(("buy", buy_id, caption, buyer))
-            seen_buy.add(buy_id)
+
+                # Mark as seen only if we successfully detected a BUY.
+                seen_buy.add(buy_id)
+                continue
+
+            # Not detected as a buy. If it is a SELL, mark as seen so we don't keep re-processing it.
+            try:
+                sell = _sell_from_receipt(h, receipt)
+            except Exception:
+                sell = None
+
+            if sell:
+                seen_buy.add(buy_id)
+                continue
+
+            # If neither buy nor sell, do NOT mark as seen.
+            # This allows a retry within the overlap window (protects against transient RPC/price issues).
         except Exception:
             continue
 
