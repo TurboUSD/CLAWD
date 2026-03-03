@@ -144,6 +144,7 @@ def _track_task(name: str, task: asyncio.Task) -> asyncio.Task:
 DEFAULT_STATE: Dict[str, Any] = {
     "min_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "emoji_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
+    "alerts_dm": True,
     "watch": {
         "last_scanned_block": 0,
         "seen": {"buy": [], "stake": [], "burn": []},
@@ -1337,6 +1338,9 @@ def _help_text() -> str:
     lines.append("/setemoji <buy|stake|burn> <usd_per_emoji>")
     lines.append("Set USD value per lobster emoji (max 100 emojis)")
     lines.append("")
+    lines.append("/alerts on|off")
+    lines.append("Enable or disable DM alerts to the admin")
+    lines.append("")
     lines.append("/cancel")
     lines.append("Cancel any running tasks")
     return "\n".join(lines)
@@ -1444,6 +1448,28 @@ async def cmd_setemoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Not allowed.")
         return
 
+
+async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Not allowed.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /alerts on|off")
+        return
+
+    arg = context.args[0].strip().lower()
+    if arg not in ("on", "off"):
+        await update.message.reply_text("Usage: /alerts on|off")
+        return
+
+    state = _load_state()
+    state["alerts_dm"] = (arg == "on")
+    _save_state(state)
+
+    await update.message.reply_text(f"OK. DM alerts {'ON' if state['alerts_dm'] else 'OFF'}.")
     if len(context.args) != 2:
         await update.message.reply_text("Usage: /setemoji <buy|stake|burn> <usd_per_emoji>")
         return
@@ -2278,12 +2304,44 @@ async def monitor(app) -> None:
                     if uid in sent_burn:
                         continue
                     sent_burn.add(uid)
-                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
-
-                # Persist before sending to avoid duplicates if the process crashes after send
+                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))                # Persist before sending to avoid duplicates if the process crashes after send
                 _save_state(state)
 
+                # Public (group) alert
                 await _send_photo_or_text(app, POST_CHAT_ID, kind, caption)
+
+                # Optional: DM alert to admin (toggle with /alerts on|off)
+                try:
+                    dm_enabled = bool(state.get("alerts_dm", True)) and bool(ADMIN_ID) and (POST_CHAT_ID != ADMIN_ID)
+                except Exception:
+                    dm_enabled = False
+
+                if dm_enabled:
+                    state.setdefault("watch", {}).setdefault("sent_dm", {"buy": [], "stake": [], "burn": []})
+                    sent_dm_buy = set(state["watch"]["sent_dm"].get("buy") or [])
+                    sent_dm_stake = set(state["watch"]["sent_dm"].get("stake") or [])
+                    sent_dm_burn = set(state["watch"]["sent_dm"].get("burn") or [])
+
+                    already = False
+                    if kind == "buy":
+                        already = (uid in sent_dm_buy)
+                        if not already:
+                            sent_dm_buy.add(uid)
+                            state["watch"]["sent_dm"]["buy"] = _prune_seen(list(sent_dm_buy))
+                    elif kind == "stake":
+                        already = (uid in sent_dm_stake)
+                        if not already:
+                            sent_dm_stake.add(uid)
+                            state["watch"]["sent_dm"]["stake"] = _prune_seen(list(sent_dm_stake))
+                    elif kind == "burn":
+                        already = (uid in sent_dm_burn)
+                        if not already:
+                            sent_dm_burn.add(uid)
+                            state["watch"]["sent_dm"]["burn"] = _prune_seen(list(sent_dm_burn))
+
+                    if not already:
+                        _save_state(state)
+                        await _send_photo_or_text(app, ADMIN_ID, kind, caption)
         except Exception:
             pass
 
@@ -2316,6 +2374,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("setmin", cmd_setmin))
     app.add_handler(CommandHandler("setemoji", cmd_setemoji))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("burned", cmd_burned))
