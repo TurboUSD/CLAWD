@@ -2307,12 +2307,13 @@ async def monitor(app) -> None:
                     state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))                # Persist before sending to avoid duplicates if the process crashes after send
                 _save_state(state)
 
-                # Public (group) alert
-                await _send_photo_or_text(app, POST_CHAT_ID, kind, caption)
+                # Public (group) alert: only BUY and BURN should be posted in the group
+                if ALLOWED_CHAT_ID and kind in ("buy", "burn"):
+                    await _send_photo_or_text(app, ALLOWED_CHAT_ID, kind, caption)
 
                 # Optional: DM alert to admin (toggle with /alerts on|off)
                 try:
-                    dm_enabled = bool(state.get("alerts_dm", True)) and bool(ADMIN_ID) and (POST_CHAT_ID != ADMIN_ID)
+                    dm_enabled = bool(state.get("alerts_dm", True)) and bool(ADMIN_ID)
                 except Exception:
                     dm_enabled = False
 
@@ -2350,10 +2351,9 @@ async def monitor(app) -> None:
 
 async def post_init(app) -> None:
     try:
-        if ALLOWED_CHAT_ID == 0:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="CLAWD bot started (test mode). Use /help")
-        else:
-            await app.bot.send_message(chat_id=POST_CHAT_ID, text="CLAWD bot started. Use /help")
+        if ADMIN_ID:
+            mode = "test mode" if ALLOWED_CHAT_ID == 0 else "group mode"
+            await app.bot.send_message(chat_id=ADMIN_ID, text=f"CLAWD bot started ({mode}). Use /help")
     except Exception:
         pass
 
