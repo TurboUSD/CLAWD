@@ -43,7 +43,13 @@ if not ANKR_MULTICHAIN_RPC_URL:
 if not ANKR_MULTICHAIN_RPC_URL and "rpc.ankr.com/base/" in (BASE_RPC_URL or ""):
     ANKR_MULTICHAIN_RPC_URL = BASE_RPC_URL.replace("rpc.ankr.com/base/", "rpc.ankr.com/multichain/")
 
-WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "30"))
+WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "180"))
+# Safety clamp to avoid excessive RPC usage
+if WATCH_POLL_SEC < 10:
+    WATCH_POLL_SEC = 10
+PRICE_CACHE_TTL_SEC = int(os.environ.get("PRICE_CACHE_TTL_SEC", "120"))  # DexScreener cache TTL
+if PRICE_CACHE_TTL_SEC < 30:
+    PRICE_CACHE_TTL_SEC = 30
 WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
 WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
 WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
@@ -504,6 +510,9 @@ def _chainlink_latest_answer(feed: str, block_number: Optional[int] = None) -> O
 # Pricing (DexScreener + Chainlink)
 # =========================
 
+# DexScreener cache to reduce HTTP requests
+_DEX_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # token -> {ts, price, fdv}
+
 def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -518,13 +527,25 @@ def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
 
 
 def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional[float]]:
+    # Cached to reduce DexScreener calls. Does NOT affect buy detection.
     try:
+        now = time.time()
+        c = _DEX_PRICE_CACHE.get(token_addr.lower())
+        if c and (now - float(c.get("ts", 0))) <= float(PRICE_CACHE_TTL_SEC):
+            return c.get("price"), c.get("fdv")
+
         p = _dex_best_pair(token_addr)
         if not p:
             return None, None
-        price = p.get("priceUsd")
-        fdv = p.get("fdv")
-        return (float(price) if price is not None else None, float(fdv) if fdv is not None else None)
+
+        price_raw = p.get("priceUsd")
+        fdv_raw = p.get("fdv")
+
+        price = float(price_raw) if price_raw is not None else None
+        fdv = float(fdv_raw) if fdv_raw is not None else None
+
+        _DEX_PRICE_CACHE[token_addr.lower()] = {"ts": now, "price": price, "fdv": fdv}
+        return price, fdv
     except Exception:
         return None, None
 
