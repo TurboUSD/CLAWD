@@ -1809,10 +1809,11 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
     """
     Return current holder count for an ERC-20 token on Base.
 
-    Strategy:
-    1) Try Etherscan v2 API (PRO): action=tokenholdercount (chainid=8453).
-    2) If not available (free key, rate limits, etc.), fallback to scraping Basescan token page HTML.
+    1) Try Etherscan v2 tokenholdercount (PRO on many plans).
+    2) Fallback: scrape basescan.org/token/<addr> by stripping HTML to text and regexing "Holders <num>".
+
     Cache TTL: 60 minutes (in-memory).
+    Env key name: ETHERSCAN_APIKEY
     """
     try:
         token = (token_addr or "").strip().lower()
@@ -1830,7 +1831,7 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
         # 1) Etherscan v2 (multichain)
         try:
             params = {
-                "chainid": 8453,
+                "chainid": 8453,  # Base mainnet
                 "module": "token",
                 "action": "tokenholdercount",
                 "contractaddress": token,
@@ -1858,17 +1859,30 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
                 url,
                 timeout=20,
                 headers={
-                    "User-Agent": "Mozilla/5.0",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
                 },
             )
             r.raise_for_status()
-            html = r.text
+            html = r.text or ""
 
-            # Look for: Holders: 12,345
-            m = re.search(r"Holders\s*:\s*</span>\s*<div[^>]*>\s*([\d,]+)", html, re.IGNORECASE)
+            # Remove scripts/styles to avoid fake matches
+            html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+            html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
+
+            # Strip tags to text
+            text = re.sub(r"(?s)<[^>]+>", " ", html)
+            text = re.sub(r"\s+", " ", text).strip()
+
+            # Prefer the "Overview" area if present
+            start_idx = text.lower().find("overview")
+            search_space = text[start_idx:] if start_idx != -1 else text
+
+            m = re.search(r"\bHolders\b\s*([0-9][0-9,]*)\b", search_space, re.IGNORECASE)
             if not m:
-                m = re.search(r">\s*Holders\s*</span>\s*</div>\s*<div[^>]*>\s*([\d,]+)", html, re.IGNORECASE)
+                # Fallback to anywhere in page
+                m = re.search(r"\bHolders\b\s*([0-9][0-9,]*)\b", text, re.IGNORECASE)
 
             if m:
                 n = int(m.group(1).replace(",", ""))
