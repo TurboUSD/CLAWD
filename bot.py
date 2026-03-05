@@ -1807,11 +1807,10 @@ _HOLDERS_CACHE: Dict[str, Dict[str, Any]] = {}  # token -> {ts, count}
 
 def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
     """
-    Return current holder count for an ERC-20 token on Base.
+    Return current holder count for an ERC-20 token on Base (chainid 8453).
 
-    Notes:
-    - This is NOT obtainable from standard JSON-RPC without an indexer, so we use Basescan's API (Etherscan-compatible).
-    - Set BASESCAN_API_KEY in env vars if you have one. It may work without, but you will get stricter limits.
+    Uses Etherscan API v2 (multichain). Your Railway env var is ETHERSCAN_APIKEY.
+    Cache TTL is 60 minutes.
     """
     try:
         token = (token_addr or "").strip().lower()
@@ -1820,21 +1819,30 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
 
         now = time.time()
         c = _HOLDERS_CACHE.get(token)
-        if c and (now - float(c.get("ts") or 0)) <= 3600:
+
+        # Cache 60 min
+        if c and (now - float(c.get("ts") or 0.0)) <= 3600:
             v = int(c.get("count") or 0)
             return v if v > 0 else None
 
         params = {
+            "chainid": 8453,  # Base mainnet
             "module": "token",
             "action": "tokenholdercount",
-            "contractaddress": token_addr,
+            "contractaddress": token,
         }
-        if BASESCAN_API_KEY:
-            params["apikey"] = BASESCAN_API_KEY
 
-        r = requests.get("https://api.basescan.org/api", params=params, timeout=20)
+        if ETHERSCAN_APIKEY:
+            params["apikey"] = ETHERSCAN_APIKEY
+
+        r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=20)
         r.raise_for_status()
-        j = r.json()
+        j = r.json() if r.content else {}
+
+        # Expected: {"status":"1","message":"OK","result":"12345"}
+        status = str(j.get("status") or "")
+        if status != "1":
+            return None
 
         res = j.get("result")
         n = int(str(res)) if res is not None else 0
@@ -1842,8 +1850,10 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
         if n > 0:
             _HOLDERS_CACHE[token] = {"ts": now, "count": n}
             return n
+
     except Exception:
         return None
+
     return None
 
 
