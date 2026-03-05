@@ -1807,14 +1807,16 @@ _HOLDERS_CACHE: Dict[str, Dict[str, Any]] = {}  # token -> {ts, count}
 
 def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
     """
-    Return current holder count for an ERC-20 token on Base (chainid 8453).
+    Return current holder count for an ERC-20 token on Base.
 
-    Uses Etherscan API v2 (multichain). Your Railway env var is ETHERSCAN_APIKEY.
-    Cache TTL is 60 minutes.
+    Strategy:
+    1) Try Etherscan v2 API (PRO): action=tokenholdercount (chainid=8453).
+    2) If not available (free key, rate limits, etc.), fallback to scraping Basescan token page HTML.
+    Cache TTL: 60 minutes (in-memory).
     """
     try:
         token = (token_addr or "").strip().lower()
-        if not token:
+        if not token or not token.startswith("0x"):
             return None
 
         now = time.time()
@@ -1825,31 +1827,56 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
             v = int(c.get("count") or 0)
             return v if v > 0 else None
 
-        params = {
-            "chainid": 8453,  # Base mainnet
-            "module": "token",
-            "action": "tokenholdercount",
-            "contractaddress": token,
-        }
+        # 1) Etherscan v2 (multichain)
+        try:
+            params = {
+                "chainid": 8453,
+                "module": "token",
+                "action": "tokenholdercount",
+                "contractaddress": token,
+            }
+            if ETHERSCAN_APIKEY:
+                params["apikey"] = ETHERSCAN_APIKEY
 
-        if ETHERSCAN_APIKEY:
-            params["apikey"] = ETHERSCAN_APIKEY
+            r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=20)
+            r.raise_for_status()
+            j = r.json() if r.content else {}
 
-        r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=20)
-        r.raise_for_status()
-        j = r.json() if r.content else {}
+            if str(j.get("status") or "") == "1":
+                res = j.get("result")
+                n = int(str(res)) if res is not None else 0
+                if n > 0:
+                    _HOLDERS_CACHE[token] = {"ts": now, "count": n}
+                    return n
+        except Exception:
+            pass
 
-        # Expected: {"status":"1","message":"OK","result":"12345"}
-        status = str(j.get("status") or "")
-        if status != "1":
-            return None
+        # 2) Fallback: scrape Basescan token page
+        try:
+            url = f"https://basescan.org/token/{token}"
+            r = requests.get(
+                url,
+                timeout=20,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            r.raise_for_status()
+            html = r.text
 
-        res = j.get("result")
-        n = int(str(res)) if res is not None else 0
+            # Look for: Holders: 12,345
+            m = re.search(r"Holders\s*:\s*</span>\s*<div[^>]*>\s*([\d,]+)", html, re.IGNORECASE)
+            if not m:
+                m = re.search(r">\s*Holders\s*</span>\s*</div>\s*<div[^>]*>\s*([\d,]+)", html, re.IGNORECASE)
 
-        if n > 0:
-            _HOLDERS_CACHE[token] = {"ts": now, "count": n}
-            return n
+            if m:
+                n = int(m.group(1).replace(",", ""))
+                if n > 0:
+                    _HOLDERS_CACHE[token] = {"ts": now, "count": n}
+                    return n
+        except Exception:
+            pass
 
     except Exception:
         return None
