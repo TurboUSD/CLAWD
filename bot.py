@@ -28,6 +28,8 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 BASE_RPC_URL = (os.environ.get("BASE_RPC_URL", "").strip() or "https://mainnet.base.org")
 ANKR_MULTICHAIN_RPC_URL = os.environ.get("ANKR_MULTICHAIN_RPC_URL", "").strip()
 
+BASESCAN_API_KEY = os.environ.get("BASESCAN_API_KEY", "").strip()
+
 # If ANKR_MULTICHAIN_RPC_URL is not set, derive it from BASE_RPC_URL when using Ankr endpoints.
 # This lets you configure only BASE_RPC_URL=https://rpc.ankr.com/base/<KEY>.
 if not ANKR_MULTICHAIN_RPC_URL:
@@ -297,6 +299,19 @@ def _short_addr(a: str) -> str:
     if len(a) <= 12:
         return a
     return f"{a[:6]}…{a[-4:]}"
+
+def _short_addr_dots(a: str, left: int = 5, right: int = 5) -> str:
+    """
+    Short address formatting using three dots, eg: 0x341...35869
+    Default keeps 0x + 3 hex chars on the left (5 chars total) and 5 on the right.
+    """
+    if not a:
+        return ""
+    a = a.strip()
+    if len(a) <= (left + right):
+        return a
+    return f"{a[:left]}...{a[-right:]}"
+
 
 
 def _hex_to_int(x: str) -> int:
@@ -1783,6 +1798,56 @@ def _get_eth_price_now() -> float:
         return 0.0
 
 
+
+# =========================
+# Basescan helpers
+# =========================
+
+_HOLDERS_CACHE: Dict[str, Dict[str, Any]] = {}  # token -> {ts, count}
+
+def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
+    """
+    Return current holder count for an ERC-20 token on Base.
+
+    Notes:
+    - This is NOT obtainable from standard JSON-RPC without an indexer, so we use Basescan's API (Etherscan-compatible).
+    - Set BASESCAN_API_KEY in env vars if you have one. It may work without, but you will get stricter limits.
+    """
+    try:
+        token = (token_addr or "").strip().lower()
+        if not token:
+            return None
+
+        now = time.time()
+        c = _HOLDERS_CACHE.get(token)
+        if c and (now - float(c.get("ts") or 0)) <= 3600:
+            v = int(c.get("count") or 0)
+            return v if v > 0 else None
+
+        params = {
+            "module": "token",
+            "action": "tokenholdercount",
+            "contractaddress": token_addr,
+        }
+        if BASESCAN_API_KEY:
+            params["apikey"] = BASESCAN_API_KEY
+
+        r = requests.get("https://api.basescan.org/api", params=params, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+
+        res = j.get("result")
+        n = int(str(res)) if res is not None else 0
+
+        if n > 0:
+            _HOLDERS_CACHE[token] = {"ts": now, "count": n}
+            return n
+    except Exception:
+        return None
+    return None
+
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -1840,12 +1905,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     incinerator_bil = incinerator_amt / 1_000_000_000.0
 
     wallet_link = f"https://basescan.org/address/{CLAWD_WALLET}"
-    wallet_html = f'<a href="{wallet_link}">{CLAWD_WALLET}</a>'
+    wallet_html = f'<a href="{wallet_link}">{_short_addr_dots(CLAWD_WALLET)}</a>'
 
     lines: List[str] = []
     lines.append("<b>📊 CLAWD Stats</b>")
     lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
     lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
+    holders = _basescan_token_holder_count(TOKEN_ADDRESS)
+    lines.append(f"Holders: {holders:,}" if holders is not None else "Holders: N/A")
     lines.append("")
     lines.append("<b>🦞 My Wallet</b>")
     lines.append(wallet_html)
