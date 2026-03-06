@@ -1928,11 +1928,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     _save_state(state)
 
+    clawdviction_wallet = "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
+    clawdlabs_wallet = "0x85Af18A392E564F68897A0518C191D0831e40a46"
+
     try:
         clawd_bal_int = _erc20_balance_of(TOKEN_ADDRESS, CLAWD_WALLET)
         weth_bal_int = _erc20_balance_of(WETH_ADDRESS, CLAWD_WALLET)
         burned_bal_int = _erc20_balance_of(TOKEN_ADDRESS, BURN_ADDRESS)
         incinerator_bal_int = _erc20_balance_of(TOKEN_ADDRESS, INCINERATOR_ADDRESS)
+        clawdviction_bal_int = _erc20_balance_of(TOKEN_ADDRESS, clawdviction_wallet)
+        clawdlabs_bal_int = _erc20_balance_of(TOKEN_ADDRESS, clawdlabs_wallet)
     except Exception as e:
         await update.message.reply_text(f"Failed to read balances from RPC: {e}")
         return
@@ -1941,11 +1946,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     weth_amt = _dec(weth_bal_int, 18)
     burned_amt = _dec(burned_bal_int, TOKEN_DECIMALS)
     incinerator_amt = _dec(incinerator_bal_int, TOKEN_DECIMALS)
+    clawdviction_amt = _dec(clawdviction_bal_int, TOKEN_DECIMALS)
+    clawdlabs_amt = _dec(clawdlabs_bal_int, TOKEN_DECIMALS)
 
     clawd_usd = (float(price or 0.0)) * clawd_amt
     weth_usd = (float(wp or 0.0)) * weth_amt
     burned_usd = (float(price or 0.0)) * burned_amt
     incinerator_usd = (float(price or 0.0)) * incinerator_amt
+    total_staked_amt = clawdviction_amt + clawdlabs_amt
+    total_staked_usd = (float(price or 0.0)) * total_staked_amt
 
     total_value = clawd_usd + weth_usd
 
@@ -1954,6 +1963,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     burned_bil = burned_amt / 1_000_000_000.0
     incinerator_pct = (incinerator_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
     incinerator_bil = incinerator_amt / 1_000_000_000.0
+    total_staked_pct = (total_staked_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
+    total_staked_bil = total_staked_amt / 1_000_000_000.0
 
     wallet_link = f"https://basescan.org/address/{CLAWD_WALLET}"
     wallet_html = f'<a href="{wallet_link}">{_short_addr_dots(CLAWD_WALLET)}</a>'
@@ -1970,6 +1981,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"{_fmt_big(clawd_amt)} CLAWD ({_fmt_int_usd(clawd_usd)})")
     lines.append(f"{_fmt_weth_two(weth_amt)} WETH ({_fmt_int_usd(weth_usd)})")
     lines.append(f"Total value: {_fmt_int_usd(total_value)}")
+    lines.append("")
+    lines.append("<b>🔒 Staked</b>")
+    lines.append(
+        f'<a href="https://basescan.org/token/{TOKEN_ADDRESS}?a={clawdviction_wallet}">Clawdviction</a>: {_fmt_big(clawdviction_amt)} CLAWD'
+    )
+    lines.append(
+        f'<a href="https://basescan.org/token/{TOKEN_ADDRESS}?a={clawdlabs_wallet}">Clawdlabs</a>: {_fmt_big(clawdlabs_amt)} CLAWD'
+    )
+    lines.append(
+        f"{total_staked_bil:.2f}B CLAWD "
+        f"({_fmt_int_usd(total_staked_usd)} · {total_staked_pct:.2f}%)"
+    )
     lines.append("")
     lines.append("<b>🔥 Burned</b>")
     lines.append(
