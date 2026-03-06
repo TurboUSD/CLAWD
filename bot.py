@@ -2346,11 +2346,15 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
 
     token_price = float(price) if price is not None else 0.0
 
+    BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT","0.10"))
+
+
     state_min = state["min_usd"]
 
     outgoing: List[Tuple[str, str, str, str]] = []  # (kind, uid, caption, wallet_addr_for_link)
 
     txs_for_buy: List[str] = []
+    tx_value_est = {}  # estimated token value per tx
     tx_seen_local = set()
 
     for lg in logs:
@@ -2402,11 +2406,22 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
                     # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
                     seen_burn.add(event_id)
 
+        if tx_hash:
+            try:
+                est = abs(_dec(amount_int, TOKEN_DECIMALS)) if 'amount_int' in locals() else 0
+                tx_value_est[tx_hash] = tx_value_est.get(tx_hash,0)+est
+            except Exception:
+                pass
         if tx_hash and tx_hash not in tx_seen_local:
             tx_seen_local.add(tx_hash)
             txs_for_buy.append(tx_hash)
 
     for h in txs_for_buy:
+        if token_price>0:
+            est_usd = tx_value_est.get(h,0)*token_price
+            if est_usd < float(state_min["buy"]) * BUY_RECEIPT_PREFILTER_PCT:
+                continue
+
         buy_id = f"buy:{h}"
         if buy_id in seen_buy:
             continue
