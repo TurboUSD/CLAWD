@@ -52,6 +52,7 @@ if WATCH_POLL_SEC < 10:
 PRICE_CACHE_TTL_SEC = int(os.environ.get("PRICE_CACHE_TTL_SEC", "120"))  # DexScreener cache TTL
 if PRICE_CACHE_TTL_SEC < 30:
     PRICE_CACHE_TTL_SEC = 30
+MAX_EVENT_AGE_SEC = int(os.environ.get("MAX_EVENT_AGE_SEC", "1800"))
 WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
 WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
 WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
@@ -576,6 +577,18 @@ def _get_block_timestamp(block_number: int) -> Optional[int]:
     except Exception:
         return None
     return None
+
+
+def _event_is_too_old(block_number: Optional[int]) -> bool:
+    if MAX_EVENT_AGE_SEC <= 0 or block_number is None:
+        return False
+    try:
+        ts = _get_block_timestamp(int(block_number))
+        if not ts:
+            return False
+        return (int(time.time()) - int(ts)) > int(MAX_EVENT_AGE_SEC)
+    except Exception:
+        return False
 
 
 def _find_block_by_timestamp(target_ts: int, latest_block: int) -> int:
@@ -1405,32 +1418,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cancelled = 0
     had_monitor = False
 
-    # Signal cancellation for any cooperative workers
     for name, ev in list(TASK_CANCEL_EVENTS.items()):
         try:
             ev.set()
         except Exception:
             pass
-
-    for name, task in list(TASK_REGISTRY.items()):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-            if name == "monitor":
-                had_monitor = True
-
-    await update.message.reply_text(f"Cancelled {cancelled} task(s).")
-
-    if had_monitor:
-        try:
-            _track_task("monitor", asyncio.create_task(monitor(context.application)))
-            await update.message.reply_text("Monitor restarted.")
-        except Exception:
-            pass
-
-
-    cancelled = 0
-    had_monitor = False
 
     for name, task in list(TASK_REGISTRY.items()):
         if not task.done():
@@ -1484,6 +1476,26 @@ async def cmd_setemoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Not allowed.")
         return
 
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /setemoji <buy|stake|burn> <usd_per_emoji>")
+        return
+
+    kind = context.args[0].strip().lower()
+    if kind not in ("buy", "stake", "burn"):
+        await update.message.reply_text("Kind must be buy, stake, or burn.")
+        return
+
+    try:
+        usd_per = float(context.args[1])
+    except Exception:
+        await update.message.reply_text("Invalid usd_per_emoji.")
+        return
+
+    state = _load_state()
+    state["emoji_usd"][kind] = max(0.01, usd_per)
+    _save_state(state)
+    await update.message.reply_text(f"OK. emoji_usd[{kind}] = {state['emoji_usd'][kind]}")
+
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
@@ -1506,25 +1518,6 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _save_state(state)
 
     await update.message.reply_text(f"OK. DM alerts {'ON' if state['alerts_dm'] else 'OFF'}.")
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /setemoji <buy|stake|burn> <usd_per_emoji>")
-        return
-
-    kind = context.args[0].strip().lower()
-    if kind not in ("buy", "stake", "burn"):
-        await update.message.reply_text("Kind must be buy, stake, or burn.")
-        return
-
-    try:
-        usd_per = float(context.args[1])
-    except Exception:
-        await update.message.reply_text("Invalid usd_per_emoji.")
-        return
-
-    state = _load_state()
-    state["emoji_usd"][kind] = max(0.01, usd_per)
-    _save_state(state)
-    await update.message.reply_text(f"OK. emoji_usd[{kind}] = {state['emoji_usd'][kind]}")
 
 
 async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> None:
@@ -2355,7 +2348,7 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
 
     state_min = state["min_usd"]
 
-    outgoing: List[Tuple[str, str, str]] = []  # (kind, caption, wallet_addr_for_link)
+    outgoing: List[Tuple[str, str, str, str]] = []  # (kind, uid, caption, wallet_addr_for_link)
 
     txs_for_buy: List[str] = []
     tx_seen_local = set()
@@ -2380,8 +2373,10 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
 
                     usd = amount * token_price
                     if usd >= float(state_min["stake"]):
-                        caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
-                        outgoing.append(("stake", event_id, caption, from_addr))
+                        block_number = int(lg.get("blockNumber", "0x0"), 16) if lg.get("blockNumber") else None
+                        if not _event_is_too_old(block_number):
+                            caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
+                            outgoing.append(("stake", event_id, caption, from_addr))
 
                     # Mark as seen only when we had a valid price.
                     # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
@@ -2398,8 +2393,10 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
 
                     usd = amount * token_price
                     if usd >= float(state_min["burn"]):
-                        caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
-                        outgoing.append(("burn", event_id, caption, from_addr))
+                        block_number = int(lg.get("blockNumber", "0x0"), 16) if lg.get("blockNumber") else None
+                        if not _event_is_too_old(block_number):
+                            caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
+                            outgoing.append(("burn", event_id, caption, from_addr))
 
                     # Mark as seen only when we had a valid price.
                     # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
@@ -2423,10 +2420,12 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
             if buy:
                 usd = float(buy["usd"])
                 if usd >= float(state_min["buy"]):
-                    tokens = float(buy["tokens"])
-                    buyer = buy["buyer"]
-                    caption = _event_caption("buy", h, tokens, usd, buyer, pay=buy.get("pay"))
-                    outgoing.append(("buy", buy_id, caption, buyer))
+                    block_number = int(receipt.get("blockNumber", "0x0"), 16) if receipt.get("blockNumber") else None
+                    if not _event_is_too_old(block_number):
+                        tokens = float(buy["tokens"])
+                        buyer = buy["buyer"]
+                        caption = _event_caption("buy", h, tokens, usd, buyer, pay=buy.get("pay"))
+                        outgoing.append(("buy", buy_id, caption, buyer))
 
                 # Mark as seen only if we successfully detected a BUY.
                 seen_buy.add(buy_id)
@@ -2484,7 +2483,9 @@ async def monitor(app) -> None:
                     if uid in sent_burn:
                         continue
                     sent_burn.add(uid)
-                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))                # Persist before sending to avoid duplicates if the process crashes after send
+                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
+
+                # Persist before sending to avoid duplicates if the process crashes after send
                 _save_state(state)
 
                 # Public (group) alert: only BUY and BURN should be posted in the group
