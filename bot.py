@@ -90,11 +90,15 @@ INCINERATOR_ADDRESS = os.environ.get(
     "0x536453350F2EeE2EB8bFeE1866bAF4fCa494A092"
 ).strip()
 
-STAKING_CONTRACT_ADDRESS = os.environ.get("STAKING_CONTRACT_ADDRESS", "").strip()
+STAKING_CONTRACT_ADDRESS = os.environ.get(
+    "STAKING_CONTRACT_ADDRESS",
+    "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
+).strip().lower()
 
 USDC_ADDRESS = os.environ.get("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
 USDT_ADDRESS = os.environ.get("USDT_ADDRESS", "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA").strip()
 WETH_ADDRESS = os.environ.get("WETH_ADDRESS", "0x4200000000000000000000000000000000000006").strip()
+
 # Ignore LP position NFT transfers / ERC-721 noise
 IGNORE_ERC721_CONTRACTS = {
     "0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F".lower(),
@@ -2491,8 +2495,8 @@ async def monitor(app) -> None:
                 if kind == "burn" and uid in sent_burn:
                     continue
 
-                # Public (group) alert: only BUY and BURN should be posted in the group
-                if ALLOWED_CHAT_ID and kind in ("buy", "burn"):
+                # Public (group) alert: BUY, STAKE and BURN
+                if ALLOWED_CHAT_ID and kind in ("buy", "stake", "burn"):
                     await _send_photo_or_text(app, ALLOWED_CHAT_ID, kind, caption)
 
                 # Mark as sent ONLY after successful send
