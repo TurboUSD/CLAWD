@@ -2484,28 +2484,29 @@ async def monitor(app) -> None:
             sent_burn = set(state["watch"]["sent_public"].get("burn") or [])
 
             for kind, uid, caption, _wallet in outgoing:
-                if kind == "buy":
-                    if uid in sent_buy:
-                        continue
-                    sent_buy.add(uid)
-                    state["watch"]["sent_public"]["buy"] = _prune_seen(list(sent_buy))
-                elif kind == "stake":
-                    if uid in sent_stake:
-                        continue
-                    sent_stake.add(uid)
-                    state["watch"]["sent_public"]["stake"] = _prune_seen(list(sent_stake))
-                elif kind == "burn":
-                    if uid in sent_burn:
-                        continue
-                    sent_burn.add(uid)
-                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
-
-                # Persist before sending to avoid duplicates if the process crashes after send
-                _save_state(state)
+                if kind == "buy" and uid in sent_buy:
+                    continue
+                if kind == "stake" and uid in sent_stake:
+                    continue
+                if kind == "burn" and uid in sent_burn:
+                    continue
 
                 # Public (group) alert: only BUY and BURN should be posted in the group
                 if ALLOWED_CHAT_ID and kind in ("buy", "burn"):
                     await _send_photo_or_text(app, ALLOWED_CHAT_ID, kind, caption)
+
+                # Mark as sent ONLY after successful send
+                if kind == "buy":
+                    sent_buy.add(uid)
+                    state["watch"]["sent_public"]["buy"] = _prune_seen(list(sent_buy))
+                elif kind == "stake":
+                    sent_stake.add(uid)
+                    state["watch"]["sent_public"]["stake"] = _prune_seen(list(sent_stake))
+                elif kind == "burn":
+                    sent_burn.add(uid)
+                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
+
+                _save_state(state)
 
                 # Optional: DM alert to admin (toggle with /alerts on|off)
                 try:
