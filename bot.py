@@ -1,1817 +1,1022 @@
 import os
 import re
 import json
-import asyncio
 import time
-import calendar
+import asyncio
 import requests
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-
-from typing import Dict, Any, List, Optional, Tuple
-from collections import defaultdict
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+from io import BytesIO
+from datetime import datetime, timezone
+from collections import defaultdict, deque
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
+# ==== ANTI-SPAM CONFIG ====
+USER_MAX_CALLS = 0          # comandos
+USER_WINDOW = 0          # segundos
 
-# =========================
-# Environment variables
-# =========================
+CHAT_MAX_CALLS = 0          # comandos
+CHAT_WINDOW = 0            # segundos
 
+SLOWDOWN_MSG = "⏳ Too unstable!! Wait a bit."
+
+# ==== CONFIG ====
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))
+ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))  # <<--- PROTECCIÓN
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-BASE_RPC_URL = (os.environ.get("BASE_RPC_URL", "").strip() or "https://mainnet.base.org")
-ANKR_MULTICHAIN_RPC_URL = os.environ.get("ANKR_MULTICHAIN_RPC_URL", "").strip()
+SUPPLY_DATA_URL = "https://turbousd.com/supply_data.php"
+TOTAL_SUPPLY = 100_000_000_000
 
-BASESCAN_API_KEY = os.environ.get("BASESCAN_API_KEY", "").strip()
+COLOR_STAKING = "#15c785"
+COLOR_TREASURY = "#f6a85b"
+COLOR_BURNED = "#ff4c4c"
+COLOR_REMAINING_WEDGE = "#e6e6e6"
+COLOR_REMAINING_LEGEND = "#bcbcbc"
+COLOR_TRADEABLE_WEDGE = "#F3D8A2"
+COLOR_CONTRACTS_WEDGE = "#C9B6FF"
+COLOR_CONTRACTS_LEGEND = "#8bcfb4"
 
-# If ANKR_MULTICHAIN_RPC_URL is not set, derive it from BASE_RPC_URL when using Ankr endpoints.
-# This lets you configure only BASE_RPC_URL=https://rpc.ankr.com/base/<KEY>.
-if not ANKR_MULTICHAIN_RPC_URL:
-    try:
-        if BASE_RPC_URL.startswith("https://rpc.ankr.com/") and "/base/" in BASE_RPC_URL:
-            ANKR_MULTICHAIN_RPC_URL = BASE_RPC_URL.replace("/base/", "/multichain/").rstrip("/")
-    except Exception:
-        pass
+user_calls = defaultdict(deque)
+chat_calls = defaultdict(deque)
+debt_cycles = {
+    "private": {"last_ts": 0, "cycle_id": 0},
+    "public": {"last_ts": 0, "cycle_id": 0},
+}
 
 
-# Convenience: if user only set BASE_RPC_URL to Ankr Base endpoint,
-# derive the multichain endpoint automatically using the same key.
-if not ANKR_MULTICHAIN_RPC_URL and "rpc.ankr.com/base/" in (BASE_RPC_URL or ""):
-    ANKR_MULTICHAIN_RPC_URL = BASE_RPC_URL.replace("rpc.ankr.com/base/", "rpc.ankr.com/multichain/")
+
+
+
+
+# ==== DEBT AND INFLATION CONFIG ====
+TREASURY_DEBT_URL = (
+    "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
+    "v2/accounting/od/debt_to_penny?page[size]=1&sort=-record_date"
+)
+
+ANNUAL_INFLATION = 0.03
+BASE_LOSS_SINCE_2020 = 0.255
+
+DATA_PATH = "/app/data"
+HISTORY_PATH = f"{DATA_PATH}/history.json"
+
+WATCH_STATE_PATH = f"{DATA_PATH}/watch_state.json"
+
+# ==== ONCHAIN WATCHERS (staking + burn) ====
+SCAN_APIKEY = (os.environ.get("ETHERSCAN_APIKEY", "") or os.environ.get("BASESCAN_API_KEY", "")).strip()
+TUSD_CONTRACT_ADDRESS = (os.environ.get("TUSD_CONTRACT_ADDRESS", "").strip() or "0x3d5e487B21E0569048c4D1A60E98C36e1B09DB07")
+
+STAKING_CONTRACT_ADDRESS = "0x2a70a42BC0524aBCA9Bff59a51E7aAdB575DC89A"
+BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
+
+DEPOSIT_METHOD_ID = "0xe2bbb158"  # deposit(uint256,uint256)
+HANDLEOPS_METHOD_ID = "0x1fad948c"  # handleOps(tuple[] ops,address beneficiary)
+
+# Common Base token addresses (used for /scan buy estimation)
+WETH_ADDRESS = "0x4200000000000000000000000000000000000006"
+USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+USDT_ADDRESS = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"
+TUSD_DECIMALS = 18
 
 WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "180"))
-# Safety clamp to avoid excessive RPC usage
-if WATCH_POLL_SEC < 10:
-    WATCH_POLL_SEC = 10
-PRICE_CACHE_TTL_SEC = int(os.environ.get("PRICE_CACHE_TTL_SEC", "120"))  # DexScreener cache TTL
-if PRICE_CACHE_TTL_SEC < 30:
-    PRICE_CACHE_TTL_SEC = 30
-MAX_EVENT_AGE_SEC = int(os.environ.get("MAX_EVENT_AGE_SEC", "1800"))
-WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
-WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
-WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
-RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))
-BLOCKS_PER_DAY = int(os.environ.get("BLOCKS_PER_DAY", "43200"))  # Base ~2s blocks
+MAX_EVENT_EMOJIS = 150
+EMOJI_PER_TUSD = 10_000_000  # fallback default
+STAKE_EMOJI_PER_TUSD = int(os.environ.get("STAKE_EMOJI_PER_TUSD", str(EMOJI_PER_TUSD)))
+BURN_EMOJI_PER_TUSD = int(os.environ.get("BURN_EMOJI_PER_TUSD", str(EMOJI_PER_TUSD)))
+BUYBACK_EMOJI_PER_TUSD = int(os.environ.get("BUYBACK_EMOJI_PER_TUSD", str(EMOJI_PER_TUSD)))
+BUYBACK_CONTRACT_ADDRESS = (os.environ.get("BUYBACK_CONTRACT_ADDRESS", "").strip() or "0x3dbF93D110C677A1c063A600cb42940262f3BBd6")
+BUYBACK_METHOD_ID = (os.environ.get("BUYBACK_METHOD_ID", "").strip().lower() or "0x79a9fa1c")
+BUYBACK_MEDIA_PATH = (os.environ.get("BUYBACK_MEDIA_PATH", "").strip() or "assets/buyback.png")
+BASE_RPC_URL = os.environ.get("BASE_RPC_URL", "").strip()
+BASESCAN_API_URL = (os.environ.get("BASESCAN_API_URL", "").strip() or "https://api.basescan.org/api")
+RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))  # blocks per eth_getLogs query
 
-DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else "/app/data")
-STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
-ETH_PRICE_CACHE_PATH = os.environ.get("ETH_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_cache.json"))
-ETH_DAILY_PRICE_CACHE_PATH = os.environ.get("ETH_DAILY_PRICE_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_daily.json"))
-ETH_DAILY_SERIES_CACHE_PATH = os.environ.get("ETH_DAILY_SERIES_CACHE_PATH", os.path.join(DATA_PATH, "eth_price_daily_series.json"))
+if not BASE_RPC_URL:
+    raise RuntimeError("BASE_RPC_URL environment variable is not set")
 
-# If ALLOWED_CHAT_ID=0, send to ADMIN_ID in private for testing
-if ALLOWED_CHAT_ID == 0:
-    if not ADMIN_ID:
-        raise RuntimeError("ALLOWED_CHAT_ID=0 but ADMIN_ID not set")
-    POST_CHAT_ID = ADMIN_ID
-else:
-    POST_CHAT_ID = ALLOWED_CHAT_ID
-
-
-# =========================
-# Project specific config (CLAWD)
-# =========================
-
-TOKEN_ADDRESS = os.environ.get("TOKEN_CONTRACT_ADDRESS", "0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07").strip()
-TOKEN_DECIMALS = int(os.environ.get("TOKEN_DECIMALS", "18"))
-TOTAL_SUPPLY = float(os.environ.get("TOTAL_SUPPLY", "100000000000"))
-
-CLAWD_WALLET = os.environ.get("CLAWD_WALLET_ADDRESS", "0x90eF2A9211A3E7CE788561E5af54C76B0Fa3aEd0").strip()
-BURN_ADDRESS = os.environ.get("BURN_ADDRESS", "0x000000000000000000000000000000000000dEaD").strip()
-
-INCINERATOR_ADDRESS = os.environ.get(
-    "INCINERATOR_ADDRESS",
-    "0x536453350F2EeE2EB8bFeE1866bAF4fCa494A092"
-).strip()
-
-STAKING_CONTRACT_ADDRESS = os.environ.get(
-    "STAKING_CONTRACT_ADDRESS",
-    "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
-).strip().lower()
-
-USDC_ADDRESS = os.environ.get("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
-USDT_ADDRESS = os.environ.get("USDT_ADDRESS", "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA").strip()
-WETH_ADDRESS = os.environ.get("WETH_ADDRESS", "0x4200000000000000000000000000000000000006").strip()
-
-# Ignore LP position NFT transfers / ERC-721 noise
-IGNORE_ERC721_CONTRACTS = {
-    "0xa990C6a764b73BF43cee5Bb40339c3322FB9D55F".lower(),
-}
-
-
-CHAINLINK_ETH_USD_FEED = os.environ.get(
-    "CHAINLINK_ETH_USD_FEED",
-    "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
-).strip()
-
-ASSET_BUY = os.environ.get("ASSET_BUY", "assets/buy.png")
-ASSET_STAKE = os.environ.get("ASSET_STAKE", "assets/stake.png")
-ASSET_BURN = os.environ.get("ASSET_BURN", "assets/burn.png")
-
-LOBSTER = "🦞"
-MAX_EMOJIS = 100
-
+# ERC20 Transfer event topic
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-def _receipt_has_ignored_erc721(receipt: Dict[str, Any]) -> bool:
-    """
-    Returns True if the tx receipt includes logs from known ERC-721 contracts
-    we want to ignore completely (eg LP position NFT transfers).
-    """
-    for lg in receipt.get("logs", []) or []:
-        addr = _norm(lg.get("address", ""))
-        if addr in IGNORE_ERC721_CONTRACTS:
-            return True
-    return False
+
+
+# Event images (place these files on disk)
+EVENT_IMAGES = {
+    "staked": {"path": "assets/staked.png"},
+    "staked_pool5": {"path": "assets/staked2.png"},
+    "burned": {"path": "assets/burned.png"},
+}
+
+HISTORY_MAX_ITEMS = 2000
+DEBT_UPDATE_DELAY_SEC = 300
+
+DEBT_UPDATE_LOCK_SECONDS = 6 * 3600  # 6h cooldown global
+
+# ==== FALLBACK DEBT GROWTH (when Treasury hasn't updated yet)
+# ~ $1T per year ≈ $31,700 per second
+FALLBACK_DEBT_GROWTH_PER_SECOND = 31_700
 
 
 
 
-# =========================
-# Global Task Registry (for /cancel)
-# =========================
-
-TASK_REGISTRY: Dict[str, asyncio.Task] = {}
-TASK_CANCEL_EVENTS: Dict[str, asyncio.Event] = {}
-
-def _track_task(name: str, task: asyncio.Task) -> asyncio.Task:
-    TASK_REGISTRY[name] = task
-
-    def _cleanup(_t: asyncio.Task) -> None:
-        TASK_REGISTRY.pop(name, None)
-        TASK_CANCEL_EVENTS.pop(name, None)
-
-    task.add_done_callback(_cleanup)
-    return task
 
 
-# =========================
-# State
-# =========================
+CPI_TABLE = {
+    # --- Historical (coarse, pre-BLS) ---
+    1800: 12.6,
+    1810: 13.5,
+    1820: 13.1,
+    1830: 13.0,
+    1840: 13.9,
+    1850: 13.1,
+    1860: 13.1,
+    1870: 14.0,
+    1880: 12.5,
+    1890: 12.9,
+    1900: 13.8,
+    1910: 15.1,
 
-DEFAULT_STATE: Dict[str, Any] = {
-    "min_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
-    "emoji_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
-    "alerts_dm": True,
-    "watch": {
-        "last_scanned_block": 0,
-        "seen": {"buy": [], "stake": [], "burn": []},
-        "sent": {"buy": [], "stake": [], "burn": []},
-        "sent_public": {"buy": [], "stake": [], "burn": []},
-        "sent_dm": {"buy": [], "stake": [], "burn": []},
-    },
-    "cache": {
-        "token_price_usd": None,
-        "token_fdv": None,
-    }
+    # --- Official CPI era (annual) ---
+    1913: 9.9,
+    1914: 10.0,
+    1915: 10.1,
+    1916: 10.9,
+    1917: 12.8,
+    1918: 15.0,
+    1919: 17.3,
+    1920: 20.0,
+    1921: 17.9,
+    1922: 16.8,
+    1923: 17.1,
+    1924: 17.1,
+    1925: 17.5,
+    1926: 17.7,
+    1927: 17.4,
+    1928: 17.1,
+    1929: 17.1,
+    1930: 17.1,
+    1931: 15.2,
+    1932: 13.7,
+    1933: 13.0,
+    1934: 13.4,
+    1935: 13.7,
+    1936: 13.9,
+    1937: 14.4,
+    1938: 14.1,
+    1939: 13.9,
+    1940: 14.0,
+    1941: 14.7,
+    1942: 16.3,
+    1943: 17.3,
+    1944: 17.6,
+    1945: 18.0,
+    1946: 19.5,
+    1947: 22.3,
+    1948: 24.1,
+    1949: 23.8,
+    1950: 24.1,
+    1951: 26.0,
+    1952: 26.5,
+    1953: 26.7,
+    1954: 26.9,
+    1955: 26.8,
+    1956: 27.2,
+    1957: 28.1,
+    1958: 28.9,
+    1959: 29.1,
+    1960: 29.6,
+    1961: 29.9,
+    1962: 30.2,
+    1963: 30.6,
+    1964: 31.0,
+    1965: 31.5,
+    1966: 32.4,
+    1967: 33.4,
+    1968: 34.8,
+    1969: 36.7,
+    1970: 38.8,
+    1971: 40.5,
+    1972: 41.8,
+    1973: 44.4,
+    1974: 49.3,
+    1975: 53.8,
+    1976: 56.9,
+    1977: 60.6,
+    1978: 65.2,
+    1979: 72.6,
+    1980: 82.4,
+    1981: 90.9,
+    1982: 96.5,
+    1983: 99.6,
+    1984: 103.9,
+    1985: 107.6,
+    1986: 109.6,
+    1987: 113.6,
+    1988: 118.3,
+    1989: 124.0,
+    1990: 130.7,
+    1991: 136.2,
+    1992: 140.3,
+    1993: 144.5,
+    1994: 148.2,
+    1995: 152.4,
+    1996: 156.9,
+    1997: 160.5,
+    1998: 163.0,
+    1999: 166.6,
+    2000: 172.2,
+    2001: 177.1,
+    2002: 179.9,
+    2003: 184.0,
+    2004: 188.9,
+    2005: 195.3,
+    2006: 201.6,
+    2007: 207.3,
+    2008: 215.3,
+    2009: 214.5,
+    2010: 218.1,
+    2011: 224.9,
+    2012: 229.6,
+    2013: 233.0,
+    2014: 236.7,
+    2015: 237.0,
+    2016: 240.0,
+    2017: 245.1,
+    2018: 251.1,
+    2019: 255.7,
+    2020: 258.8,
+    2021: 270.9,
+    2022: 292.7,
+    2023: 305.3,
+    2024: 318.0,
+    2025: 324.8,  # proxy
 }
 
 
-def _ensure_data_dir() -> None:
+# ==== MEMES FOR DEBT FLOW ====
+MEMES = {
+    "debt_main": {
+        "number": 433,
+        "path": "assets/433.jpeg",
+    },
+    "debt_update": {
+        "number": 6,
+        "path": "assets/6.jpeg",
+    },
+}
+
+
+MEME_BYTES = {}
+
+ANTI_SPAM_ENABLED = False
+
+WATCHER_STARTED = False
+WATCH_LOCK = asyncio.Lock()
+
+
+
+
+
+
+
+
+
+
+async def global_command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+
+
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user or not chat:
+        return
+
+    user_id = user.id
+    chat_id = chat.id
+
+    # 👑 ADMIN BYPASS
+    if user_id == ADMIN_ID:
+        return
+
+    # 🚫 ANTI-SPAM OFF
+    if not ANTI_SPAM_ENABLED:
+        return
+
+
+
+    now = time.time()
+
+    # =====================================================
+    # 👤 USER RATE LIMIT (PRIVATE + PUBLIC)
+    # =====================================================
+    q_user = user_calls[user_id]
+    while q_user and now - q_user[0] > USER_WINDOW:
+        q_user.popleft()
+
+    if len(q_user) >= USER_MAX_CALLS:
+        await update.message.reply_text(SLOWDOWN_MSG)
+        return
+
+    q_user.append(now)
+
+    # =====================================================
+    # 🔒 PRIVATE CHAT → STOP HERE
+    # =====================================================
+    if chat.type == "private":
+        return
+
+    # =====================================================
+    # 🔒 PUBLIC CHAT PROTECTION
+    # =====================================================
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return
+
+    # =====================================================
+    # 💬 CHAT RATE LIMIT (PUBLIC ONLY)
+    # =====================================================
+    q_chat = chat_calls[chat_id]
+    while q_chat and now - q_chat[0] > CHAT_WINDOW:
+        q_chat.popleft()
+
+    if len(q_chat) >= CHAT_MAX_CALLS:
+        await update.message.reply_text(SLOWDOWN_MSG)
+        return
+
+    q_chat.append(now)
+
+
+
+
+
+
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def ensure_data_dir():
     os.makedirs(DATA_PATH, exist_ok=True)
+    if not os.path.exists(HISTORY_PATH):
+        _atomic_write_json(HISTORY_PATH, {"debt_snapshots": []})
 
 
-def _load_state() -> Dict[str, Any]:
-    _ensure_data_dir()
-    if not os.path.exists(STATE_PATH):
-        return json.loads(json.dumps(DEFAULT_STATE))
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        merged = json.loads(json.dumps(DEFAULT_STATE))
-
-        if isinstance(s, dict):
-            merged.update(s)
-        if isinstance(s.get("min_usd"), dict):
-            merged["min_usd"].update(s["min_usd"])
-        if isinstance(s.get("emoji_usd"), dict):
-            merged["emoji_usd"].update(s["emoji_usd"])
-        if isinstance(s.get("watch"), dict):
-            merged["watch"].update(s["watch"])
-        if isinstance(s.get("watch", {}).get("seen"), dict):
-            merged["watch"]["seen"].update(s["watch"]["seen"])
-        if isinstance(s.get("watch", {}).get("sent"), dict):
-            merged["watch"].setdefault("sent", {"buy": [], "stake": [], "burn": []})
-            merged["watch"]["sent"].update(s["watch"]["sent"])
-        if isinstance(s.get("watch", {}).get("sent_public"), dict):
-            merged["watch"].setdefault("sent_public", {"buy": [], "stake": [], "burn": []})
-            merged["watch"]["sent_public"].update(s["watch"]["sent_public"])
-        if isinstance(s.get("watch", {}).get("sent_dm"), dict):
-            merged["watch"].setdefault("sent_dm", {"buy": [], "stake": [], "burn": []})
-            merged["watch"]["sent_dm"].update(s["watch"]["sent_dm"])
-        if isinstance(s.get("cache"), dict):
-            merged["cache"].update(s["cache"])
-
-        for k in ("buy", "stake", "burn"):
-            merged["watch"]["seen"][k] = list(merged["watch"]["seen"].get(k) or [])
-            merged["watch"].setdefault("sent", {}).setdefault(k, [])
-            merged["watch"]["sent"][k] = list(merged["watch"]["sent"].get(k) or [])
-            merged["watch"].setdefault("sent_public", {}).setdefault(k, [])
-            merged["watch"]["sent_public"][k] = list(merged["watch"]["sent_public"].get(k) or [])
-            merged["watch"].setdefault("sent_dm", {}).setdefault(k, [])
-            merged["watch"]["sent_dm"][k] = list(merged["watch"]["sent_dm"].get(k) or [])
-
-        return merged
-    except Exception:
-        return json.loads(json.dumps(DEFAULT_STATE))
-
-
-def _save_state(state: Dict[str, Any]) -> None:
-    _ensure_data_dir()
-    tmp = STATE_PATH + ".tmp"
+def _atomic_write_json(path: str, obj: dict):
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_PATH)
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
-
-# =========================
-# Burned cache (per day)
-# =========================
-
-BURNED_CACHE_FILENAME = os.environ.get("BURNED_CACHE_FILENAME", "burned_cache.json").strip()
-
-def _burned_cache_path() -> str:
-    try:
-        os.makedirs(DATA_PATH, exist_ok=True)
-    except Exception:
-        pass
-    return os.path.join(DATA_PATH, BURNED_CACHE_FILENAME)
-
-def _load_burned_cache() -> Dict[str, Any]:
-    path = _burned_cache_path()
+def _read_json(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            c = json.load(f)
+            return json.load(f)
     except Exception:
-        c = {}
-
-    if not isinstance(c, dict):
-        c = {}
-
-    # Reset cache if it belongs to another token/burn addr
-    if _norm(str(c.get("token", ""))) not in ("", _norm(TOKEN_ADDRESS)):
-        c = {}
-    if _norm(str(c.get("burn_address", ""))) not in ("", _norm(BURN_ADDRESS)):
-        c = {}
-
-    c.setdefault("token", TOKEN_ADDRESS)
-    c.setdefault("burn_address", BURN_ADDRESS)
-    c.setdefault("decimals", TOKEN_DECIMALS)
-    c.setdefault("min_scanned_block", 0)
-    c.setdefault("max_scanned_block", 0)
-    c.setdefault("days", {})
-    if not isinstance(c["days"], dict):
-        c["days"] = {}
-    return c
-
-def _save_burned_cache(cache: Dict[str, Any]) -> None:
-    path = _burned_cache_path()
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-def _ymd_utc_from_ts(ts: int) -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
-
-def _prune_seen(arr: List[str]) -> List[str]:
-    if len(arr) <= WATCH_MAX_SEEN_EVENTS:
-        return arr
-    return arr[-WATCH_MAX_SEEN_EVENTS:]
+        return {"debt_snapshots": []}
 
 
-# =========================
-# Formatting
-# =========================
-
-def _norm(a: str) -> str:
-    return (a or "").lower()
-
-
-def _short_addr(a: str) -> str:
-    if not a:
-        return ""
-    a = a.strip()
-    if len(a) <= 12:
-        return a
-    return f"{a[:6]}…{a[-4:]}"
-
-def _short_addr_dots(a: str, left: int = 5, right: int = 5) -> str:
-    """
-    Short address formatting using three dots, eg: 0x341...35869
-    Default keeps 0x + 3 hex chars on the left (5 chars total) and 5 on the right.
-    """
-    if not a:
-        return ""
-    a = a.strip()
-    if len(a) <= (left + right):
-        return a
-    return f"{a[:left]}...{a[-right:]}"
+def load_history() -> dict:
+    ensure_data_dir()
+    data = _read_json(HISTORY_PATH)
+    if "debt_snapshots" not in data or not isinstance(data["debt_snapshots"], list):
+        data = {"debt_snapshots": []}
+    return data
 
 
-
-def _hex_to_int(x: str) -> int:
-    return int(x, 16)
-
-
-def _dec(v_int: int, decimals: int) -> float:
-    return v_int / (10 ** decimals)
-
-
-def _fmt_price(price: float) -> str:
-    s = f"{price:.10f}".rstrip("0").rstrip(".")
-    return f"${s}"
+def append_debt_snapshot(snapshot: dict):
+    data = load_history()
+    snaps = data["debt_snapshots"]
+    snaps.append(snapshot)
+    if len(snaps) > HISTORY_MAX_ITEMS:
+        data["debt_snapshots"] = snaps[-HISTORY_MAX_ITEMS:]
+    _atomic_write_json(HISTORY_PATH, data)
 
 
-def _fmt_int_usd(x: float) -> str:
-    return f"${int(round(x)):,}"
+def fmt_usd_int(n: int) -> str:
+    return f"${n:,}"
 
 
-def _fmt_big(n: float) -> str:
-    if n >= 1_000_000_000:
-        return f"{n/1_000_000_000:.2f}B"
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.2f}K"
-    return f"{n:.0f}"
-
-
-def _fmt_token_amount(n: float) -> str:
-    return f"{n:,.0f}"
-
-
-def _fmt_weth_two(n: float) -> str:
-    return f"{n:.2f}"
-
-
-def _fmt_usd_compact(x: float) -> str:
-    if x >= 1_000_000_000:
-        return f"${x/1_000_000_000:.2f}B"
-    if x >= 1_000_000:
-        return f"${x/1_000_000:.2f}M"
-    if x >= 1_000:
-        return f"${x/1_000:.2f}K"
-    return f"${x:.2f}"
-
-def _fmt_compact_int(n: float) -> str:
-    v = float(n)
-    av = abs(v)
-    if av >= 1_000_000_000:
-        return f"{int(round(v / 1_000_000_000.0))}B"
-    if av >= 1_000_000:
-        return f"{int(round(v / 1_000_000.0))}M"
-    if av >= 1_000:
-        return f"{int(round(v / 1_000.0))}K"
-    return str(int(round(v)))
-
-
-
-
-def _fmt_num(n: float) -> str:
-    # Alias used by /burned output
-    return _fmt_compact_int(n)
-
-
-def _fmt_axis_millions(x, pos):
-    try:
-        v = float(x)
-    except Exception:
-        return "0"
-    if v == 0:
-        return "0"
-    return f"{int(round(v / 1_000_000.0))}M"
-def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
-    if usd_per_emoji <= 0:
-        usd_per_emoji = 100.0
-
-    n = int(total_usd / usd_per_emoji)
-
-    if n < 1:
-        n = 1
-    if n > MAX_EMOJIS:
-        n = MAX_EMOJIS
-
-    return emoji * n
-
-
-# =========================
-# RPC
-# =========================
-
-def _rpc(method: str, params: List[Any]) -> Any:
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(BASE_RPC_URL, json=payload, timeout=12)
+def fetch_latest_us_debt() -> dict:
+    r = requests.get(TREASURY_DEBT_URL, timeout=15)
     r.raise_for_status()
     j = r.json()
-    if "error" in j:
-        raise RuntimeError(str(j["error"]))
-    return j["result"]
-
-
-def _get_code(addr: str, block_tag: str = "latest") -> str:
-    return _rpc("eth_getCode", [addr, block_tag])
-
-
-def _is_contract(addr: str, block_number: Optional[int] = None) -> bool:
-    try:
-        tag = hex(int(block_number)) if block_number is not None else "latest"
-        code = _get_code(addr, tag)
-        return isinstance(code, str) and code not in ("0x", "0x0", "")
-    except Exception:
-        # If in doubt, do not classify as contract here
-        return False
-
-
-def _get_latest_block() -> int:
-    return _hex_to_int(_rpc("eth_blockNumber", []))
-
-def _approx_start_block(end_block: int, days: int) -> int:
-    # Approximate block range to avoid expensive timestamp binary search.
-    # Base blocks are ~2 seconds, ~43,200 blocks/day.
-    try:
-        bpd = max(1000, int(BLOCKS_PER_DAY))
-    except Exception:
-        bpd = 43200
-    return max(0, int(end_block) - int(days) * bpd)
-
-
-
-def _get_receipt(tx_hash: str) -> Dict[str, Any]:
-    return _rpc("eth_getTransactionReceipt", [tx_hash])
-
-
-def _get_tx(tx_hash: str) -> Dict[str, Any]:
-    return _rpc("eth_getTransactionByHash", [tx_hash])
-
-
-def _topic_addr(topic_32: str) -> str:
-    return "0x" + topic_32[-40:]
-
-
-def _get_logs_chunked(address: str, from_block: int, to_block: int) -> List[Dict[str, Any]]:
-    all_logs: List[Dict[str, Any]] = []
-    if from_block > to_block:
-        return all_logs
-
-    cur = from_block
-    while cur <= to_block:
-        end = min(to_block, cur + max(1, RPC_LOG_CHUNK) - 1)
-        chunk = _rpc("eth_getLogs", [{
-            "fromBlock": hex(cur),
-            "toBlock": hex(end),
-            "address": address,
-            "topics": [TRANSFER_TOPIC0],
-        }])
-        all_logs.extend(chunk or [])
-        cur = end + 1
-
-    return all_logs
-
-
-def _get_logs_chunked_topics(address: str, from_block: int, to_block: int, topics: List[Optional[str]]) -> List[Dict[str, Any]]:
-    all_logs: List[Dict[str, Any]] = []
-    if from_block > to_block:
-        return all_logs
-
-    cur = from_block
-    while cur <= to_block:
-        end = min(to_block, cur + max(1, RPC_LOG_CHUNK) - 1)
-        chunk = _rpc("eth_getLogs", [{
-            "fromBlock": hex(cur),
-            "toBlock": hex(end),
-            "address": address,
-            "topics": topics,
-        }])
-        all_logs.extend(chunk or [])
-        cur = end + 1
-
-    return all_logs
-
-
-def _erc20_balance_of(token: str, holder: str) -> int:
-    selector = "0x70a08231"
-    holder_padded = holder.lower().replace("0x", "").rjust(64, "0")
-    data = selector + holder_padded
-    out = _rpc("eth_call", [{"to": token, "data": data}, "latest"])
-    return int(out, 16)
-
-
-def _eth_call(to: str, data: str, block_tag: str = "latest") -> str:
-    return _rpc("eth_call", [{"to": to, "data": data}, block_tag])
-
-
-def _chainlink_decimals(feed: str) -> int:
-    out = _eth_call(feed, "0x313ce567")
-    return int(out, 16)
-
-
-def _chainlink_latest_answer(feed: str, block_number: Optional[int] = None) -> Optional[float]:
-    try:
-        dec = _chainlink_decimals(feed)
-        block_tag = hex(block_number) if block_number is not None else "latest"
-        out = _eth_call(feed, "0xfeaf968c", block_tag=block_tag)  # latestRoundData()
-        answer_int = int(out[2 + 64:2 + 128], 16)
-        return answer_int / (10 ** dec)
-    except Exception:
-        return None
-
-
-# =========================
-# Pricing (DexScreener + Chainlink)
-# =========================
-
-# DexScreener cache to reduce HTTP requests
-_DEX_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}  # token -> {ts, price, fdv}
-
-def _dex_best_pair(token_addr: str) -> Dict[str, Any]:
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, timeout=25, headers=headers)
-    r.raise_for_status()
-    j = r.json()
-    pairs = j.get("pairs") or []
-    if not pairs:
-        return {}
-    pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
-    return pairs[0]
-
-
-def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional[float]]:
-    # Cached to reduce DexScreener calls. Does NOT affect buy detection.
-    try:
-        now = time.time()
-        c = _DEX_PRICE_CACHE.get(token_addr.lower())
-        if c and (now - float(c.get("ts", 0))) <= float(PRICE_CACHE_TTL_SEC):
-            return c.get("price"), c.get("fdv")
-
-        p = _dex_best_pair(token_addr)
-        if not p:
-            return None, None
-
-        price_raw = p.get("priceUsd")
-        fdv_raw = p.get("fdv")
-
-        price = float(price_raw) if price_raw is not None else None
-        fdv = float(fdv_raw) if fdv_raw is not None else None
-
-        _DEX_PRICE_CACHE[token_addr.lower()] = {"ts": now, "price": price, "fdv": fdv}
-        return price, fdv
-    except Exception:
-        return None, None
-
-
-
-
-def _get_block_timestamp(block_number: int) -> Optional[int]:
-    try:
-        blk = _rpc("eth_getBlockByNumber", [hex(block_number), False])
-        ts_hex = blk.get("timestamp")
-        if isinstance(ts_hex, str) and ts_hex.startswith("0x"):
-            return int(ts_hex, 16)
-    except Exception:
-        return None
-    return None
-
-
-def _event_is_too_old(block_number: Optional[int]) -> bool:
-    if MAX_EVENT_AGE_SEC <= 0 or block_number is None:
-        return False
-    try:
-        ts = _get_block_timestamp(int(block_number))
-        if not ts:
-            return False
-        return (int(time.time()) - int(ts)) > int(MAX_EVENT_AGE_SEC)
-    except Exception:
-        return False
-
-
-def _find_block_by_timestamp(target_ts: int, latest_block: int) -> int:
-    """Binary search the first block whose timestamp is >= target_ts."""
-    lo = 0
-    hi = max(0, latest_block)
-
-    ts_cache: Dict[int, int] = {}
-
-    def _ts(bn: int) -> int:
-        if bn in ts_cache:
-            return ts_cache[bn]
-        t = _get_block_timestamp(bn)
-        if t is None:
-            t = 0
-        ts_cache[bn] = int(t)
-        return ts_cache[bn]
-
-    if _ts(hi) < target_ts:
-        return hi
-
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if _ts(mid) >= target_ts:
-            hi = mid
-        else:
-            lo = mid + 1
-
-    return lo
-
-
-def _load_eth_price_cache() -> Dict[str, float]:
-    _ensure_data_dir()
-    if not os.path.exists(ETH_PRICE_CACHE_PATH):
-        return {}
-    try:
-        with open(ETH_PRICE_CACHE_PATH, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        if isinstance(j, dict):
-            return {str(k): float(v) for k, v in j.items()}
-    except Exception:
-        pass
-    return {}
-
-
-def _save_eth_price_cache(cache: Dict[str, float]) -> None:
-    _ensure_data_dir()
-    tmp = ETH_PRICE_CACHE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ETH_PRICE_CACHE_PATH)
-
-
-def _load_eth_daily_cache() -> Dict[str, float]:
-    _ensure_data_dir()
-    if not os.path.exists(ETH_DAILY_PRICE_CACHE_PATH):
-        return {}
-    try:
-        with open(ETH_DAILY_PRICE_CACHE_PATH, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        if isinstance(j, dict):
-            return {str(k): float(v) for k, v in j.items()}
-    except Exception:
-        pass
-    return {}
-
-
-def _save_eth_daily_cache(cache: Dict[str, float]) -> None:
-    _ensure_data_dir()
-    tmp = ETH_DAILY_PRICE_CACHE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ETH_DAILY_PRICE_CACHE_PATH)
-
-
-def _load_eth_daily_series_cache() -> Dict[str, Any]:
-    _ensure_data_dir()
-    if not os.path.exists(ETH_DAILY_SERIES_CACHE_PATH):
-        return {}
-    try:
-        with open(ETH_DAILY_SERIES_CACHE_PATH, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return j if isinstance(j, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_eth_daily_series_cache(cache: Dict[str, Any]) -> None:
-    _ensure_data_dir()
-    tmp = ETH_DAILY_SERIES_CACHE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f)
-    os.replace(tmp, ETH_DAILY_SERIES_CACHE_PATH)
-
-
-
-def _eth_usd_daily(date_utc: str) -> Optional[float]:
-    """
-    Return an approximate ETH/USD for a given UTC date (YYYY-MM-DD).
-    This is intentionally "daily" to avoid rate limits: at most 1 HTTP call per date, cached on disk.
-    """
-    try:
-        cache = _load_eth_daily_cache()
-        if date_utc in cache and cache[date_utc] > 0:
-            return float(cache[date_utc])
-
-        # CoinGecko daily history endpoint (no Basescan). Cached so it is rarely called.
-        # Date format required: dd-mm-yyyy
-        y, m, d = date_utc.split("-")
-        cg_date = f"{d}-{m}-{y}"
-        url = f"https://api.coingecko.com/api/v3/coins/ethereum/history?date={cg_date}&localization=false"
-        r = requests.get(url, timeout=20, headers={"accept": "application/json"})
-        if r.status_code == 429:
-            return None
-        r.raise_for_status()
-        j = r.json()
-        price = (
-            j.get("market_data", {})
-             .get("current_price", {})
-             .get("usd", None)
-        )
-        if isinstance(price, (int, float)) and price > 0:
-            cache[date_utc] = float(price)
-            # keep cache bounded (last 400 days)
-            if len(cache) > 400:
-                keys_sorted = sorted(cache.keys())
-                for k in keys_sorted[:-400]:
-                    cache.pop(k, None)
-            _save_eth_daily_cache(cache)
-            return float(price)
-    except Exception:
-        return None
-    return None
-
-def _ankr_multichain_rpc(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Call Ankr Advanced API (multichain) JSON-RPC methods like ankr_getTokenPriceHistory.
-    Requires ANKR_MULTICHAIN_RPC_URL to be set, eg:
-      https://rpc.ankr.com/multichain/<YOUR_API_KEY>
-    """
-    if not ANKR_MULTICHAIN_RPC_URL:
-        raise RuntimeError("ANKR_MULTICHAIN_RPC_URL not set")
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(ANKR_MULTICHAIN_RPC_URL, json=payload, timeout=25, headers={"Content-Type": "application/json"})
-    r.raise_for_status()
-    j = r.json()
-    if isinstance(j, dict) and j.get("error"):
-        raise RuntimeError(str(j["error"]))
-    return j.get("result") or {}
-
-
-def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
-    """
-    Fetch ETH/USD close to ts using Ankr Token API price history.
-    We query on Base native coin price history (contractAddress omitted).
-    """
-    try:
-        # Round to hour to reduce requests
-        hour = int(ts) - (int(ts) % 3600)
-        frm = max(0, hour - 3600)
-        to = hour + 3600
-        # Use Ethereum for ETH/USD history. Base's native coin is ETH, and using
-        # "eth" avoids any chain-specific indexing quirks while keeping the
-        # USD price correct.
-        res = _ankr_multichain_rpc("ankr_getTokenPriceHistory", {
-            "blockchain": "eth",
-            "fromTimestamp": frm,
-            "toTimestamp": to,
-            "interval": 3600,
-            "limit": 5,
-            "syncCheck": False,
-        })
-        quotes = res.get("quotes") or []
-        if not quotes:
-            return None
-        best = min(quotes, key=lambda q: abs(int(q.get("timestamp") or 0) - int(ts)))
-        p = best.get("usdPrice")
-        return float(p) if p is not None else None
-    except Exception:
-        return None
-
-
-
-def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
-    """
-    Read Chainlink ETH/USD price at a specific block using eth_call with block tag.
-    This avoids any external HTTP price APIs and works on standard (non-archive) RPC
-    as long as the block is still available (recent history).
-    """
-    try:
-        # latestRoundData() selector
-        data = "0x" + "feaf968c"
-        res = _rpc("eth_call", [{
-            "to": CHAINLINK_ETH_USD_FEED,
-            "data": data,
-        }, hex(int(block_number))])
-        if not isinstance(res, str) or not res.startswith("0x"):
-            return None
-        raw = bytes.fromhex(res[2:])
-        if len(raw) < 32 * 5:
-            return None
-        # return values: (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
-        answer_bytes = raw[32:64]
-        answer = int.from_bytes(answer_bytes, byteorder="big", signed=True)
-        if answer <= 0:
-            return None
-        # Chainlink ETH/USD feeds are typically 8 decimals
-        return float(answer) / 1e8
-    except Exception:
-        return None
-
-
-
-# Chainlink ETH/USD feed on Base Mainnet (proxy)
-# Source: https://data.chain.link/feeds/base/base/eth-usd
-CHAINLINK_ETH_USD_FEED_BASE = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
-_CL_ETHUSD_DECIMALS: Optional[int] = None
-
-def _abi_int256_from_32(word: bytes) -> int:
-    # word is 32 bytes, two's complement
-    as_int = int.from_bytes(word, byteorder="big", signed=False)
-    if as_int >= 2**255:
-        as_int -= 2**256
-    return as_int
-
-def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
-    """Return ETH/USD using Chainlink's Base ETH/USD feed at a specific block.
-
-    This uses eth_call with a block tag, so it requires an RPC that can serve historical state (archive).
-    """
-    global _CL_ETHUSD_DECIMALS
-    try:
-        block_tag = hex(int(block_number))
-        if _CL_ETHUSD_DECIMALS is None:
-            dec_hex = _eth_call(CHAINLINK_ETH_USD_FEED_BASE, "0x313ce567", block_tag)  # decimals()
-            dec = int(dec_hex, 16)
-            if dec <= 0 or dec > 36:
-                return None
-            _CL_ETHUSD_DECIMALS = dec
-
-        data = _eth_call(CHAINLINK_ETH_USD_FEED_BASE, "0xfeaf968c", block_tag)  # latestRoundData()
-        raw = bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith("0x") else b""
-        if len(raw) < 32 * 5:
-            return None
-        # layout: roundId, answer, startedAt, updatedAt, answeredInRound
-        answer_word = raw[32:64]
-        answer = _abi_int256_from_32(answer_word)
-        if answer <= 0:
-            return None
-        return float(answer) / (10 ** int(_CL_ETHUSD_DECIMALS))
-    except Exception:
-        return None
-
-
-def _weth_price_usd(block_number: Optional[int] = None, *, allow_live_fallback: bool = True) -> Optional[float]:
-    """Return ETH/USD.
-
-    Priority order:
-    1) Chainlink ETH/USD feed on Base at the tx block (eth_call with block tag).
-    2) Ankr price history near the tx timestamp with local hourly cache.
-    3) Live fallback (DexScreener) ONLY when allow_live_fallback=True.
-    """
-    # 1) Chainlink per-block, when available
-    if block_number is not None:
-        px = _chainlink_eth_usd_at_block(int(block_number))
-        if px is not None and px > 0:
-            return float(px)
-        if not allow_live_fallback:
-            # For historical scans, do not lie with a live price.
-            return None
-
-    # 2) Ankr hourly cache (near timestamp)
-    try:
-        if block_number is not None:
-            ts = _get_block_timestamp(block_number)
-            if ts:
-                hour_key = time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(int(ts)))
-                cache = _load_eth_hourly_cache()
-                if hour_key in cache and cache[hour_key] > 0:
-                    return float(cache[hour_key])
-
-                # Pull a 24h window and take the closest hour
-                px = _eth_usd_hourly_series_near_ts(int(ts))
-                if px is not None and px > 0:
-                    cache[hour_key] = float(px)
-                    _save_eth_hourly_cache(cache)
-                    return float(px)
-    except Exception:
-        pass
-
-    # 3) Live fallback (only for near-realtime buys if enabled)
-    if allow_live_fallback:
-        try:
-            live = _eth_usd_live()
-            if live is not None and live > 0:
-                return float(live)
-        except Exception:
-            pass
-
-    return None
-
-def _aggregate_net_deltas_from_receipt(
-    receipt: Dict[str, Any],
-    token_addresses: Dict[str, int],
-) -> Dict[str, Dict[str, int]]:
-    deltas: Dict[str, Dict[str, int]] = {}
-    for taddr in token_addresses.keys():
-        deltas[_norm(taddr)] = defaultdict(int)
-
-    for lg in receipt.get("logs", []) or []:
-        addr = _norm(lg.get("address", ""))
-        if addr not in deltas:
-            continue
-
-        topics = lg.get("topics") or []
-        if len(topics) < 3:
-            continue
-        if _norm(topics[0]) != TRANSFER_TOPIC0:
-            continue
-
-        from_addr = _norm(_topic_addr(topics[1]))
-        to_addr = _norm(_topic_addr(topics[2]))
-        value_int = int(lg.get("data", "0x0"), 16)
-
-        deltas[addr][from_addr] -= value_int
-        deltas[addr][to_addr] += value_int
-
-    return deltas
-
-
-def _pick_final_buyer(token_deltas: Dict[str, int], exclude_addrs: List[str]) -> Optional[str]:
-    exclude = set(_norm(a) for a in exclude_addrs if a)
-    best_addr = None
-    best_delta = 0
-    for addr, delta in token_deltas.items():
-        if addr in exclude:
-            continue
-        if delta > best_delta:
-            best_delta = delta
-            best_addr = addr
-    return best_addr
-
-
-def _max_outflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], int]:
-    best_addr = None
-    best_out = 0
-    for addr, d in (deltas_for_token or {}).items():
-        if d < 0 and -d > best_out:
-            best_out = -d
-            best_addr = addr
-    return best_addr, best_out
-
-
-def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_fallback: bool = False) -> Optional[Dict[str, Any]]:
-    if _receipt_has_ignored_erc721(receipt):
-        return None
-
-    # Use the receipt block number for historic Chainlink reads (eth_call at that block)
-    block_number = None
-    try:
-        bn_hex = receipt.get("blockNumber")
-        if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
-            block_number = int(bn_hex, 16)
-    except Exception:
-        block_number = None
-
-    token_addresses = {
-        TOKEN_ADDRESS: TOKEN_DECIMALS,
-        USDC_ADDRESS: 6,
-        USDT_ADDRESS: 6,
-        WETH_ADDRESS: 18,
-    }
-
-    deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
-    tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
-    if not tdel:
-        return None
-
-    exclude = [
-        TOKEN_ADDRESS,
-        USDC_ADDRESS,
-        USDT_ADDRESS,
-        WETH_ADDRESS,
-        BURN_ADDRESS,
-        STAKING_CONTRACT_ADDRESS,
-    ]
-
-    buyer = _pick_final_buyer(tdel, exclude)
-    if not buyer:
-        return None
-
-    # If final receiver is a contract, it is not a personal buy
-    if _is_contract(buyer, block_number):
-        return None
-
-    tokens_delta_int = int(tdel.get(buyer, 0))
-    if tokens_delta_int <= 0:
-        return None
-
-    tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
-
-    # Price estimate for sanity filtering
-    state = _load_state()
-    cache = state.get("cache") or {}
-    state["cache"] = cache
-
-    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-    if price is not None:
-        cache["token_price_usd"] = float(price)
-    else:
-        price = cache.get("token_price_usd")
-
-    _save_state(state)
-
-    usd_est = (float(price) if price is not None else 0.0) * float(tokens_bought)
-
-    usdc_del = deltas.get(_norm(USDC_ADDRESS)) or {}
-    usdt_del = deltas.get(_norm(USDT_ADDRESS)) or {}
-    weth_del = deltas.get(_norm(WETH_ADDRESS)) or {}
-
-    payer_usdc, usdc_out = _max_outflow_addr(usdc_del)
-    payer_usdt, usdt_out = _max_outflow_addr(usdt_del)
-    payer_weth, weth_out = _max_outflow_addr(weth_del)
-
-    payer = None
-    spent_usd = 0.0
-    eth_spent_total = 0.0
-    usdc_spent = 0.0
-    usdt_spent = 0.0
-    weth_spent = 0.0
-
-    # Always fetch tx once. We use tx.value to decide the payment path.
-    tx_from = ""
-    eth_value_int = 0
-    try:
-        tx = _get_tx(tx_hash)
-        tx_from = _norm(tx.get("from", ""))
-        eth_value_int = int(tx.get("value", "0x0"), 16)
-    except Exception:
-        tx = None
-
-    # If the tx paid native ETH (tx.value > 0), treat this as an ETH-paid buy.
-    # In that case, ignore any USDC/USDT movements inside the tx (they can be pool
-    # rebalancing, internal router actions, or proceeds), and value ONLY the ETH.
-    paid_with_eth = False
-    if eth_value_int > 0:
-        paid_with_eth = True
-        payer = tx_from or buyer
-        eth_spent_total = _dec(eth_value_int, 18)
-        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback)
-        if wp is None or wp <= 0:
-            return None
-        spent_usd = eth_spent_total * float(wp)
-    else:
-        # Stablecoin path: only count outflows from the inferred payer address.
-        if usdc_out > 0 or usdt_out > 0:
-            payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
-            if payer:
-                # If tx.from is an EOA, require payer == tx.from (prevents sells tagged as buys)
-                # If tx.from is a contract (relayer/router), allow payer != tx.from but require payer to be an EOA
-                if tx_from:
-                    if not _is_contract(tx_from, block_number):
-                        if _norm(payer) != _norm(tx_from):
-                            return None
-                    else:
-                        # Relayed transaction: payer must not be a contract
-                        if _is_contract(payer, block_number):
-                            return None
-
-                usdc_spent = _dec(max(0, -usdc_del.get(payer, 0)), 6)
-                usdt_spent = _dec(max(0, -usdt_del.get(payer, 0)), 6)
-                spent_usd = usdc_spent + usdt_spent
-
-        # Fallback: WETH path
-        if spent_usd <= 0 and weth_out > 0 and payer_weth:
-            payer = payer_weth
-
-            # If tx.from is an EOA, require payer == tx.from (prevents sells tagged as buys)
-            # If tx.from is a contract (relayer/router), allow payer != tx.from but require payer to be an EOA
-            if tx_from:
-                if not _is_contract(tx_from, block_number):
-                    if _norm(payer) != _norm(tx_from):
-                        return None
-                else:
-                    # Relayed transaction: payer must not be a contract
-                    if _is_contract(payer, block_number):
-                        return None
-
-            wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback)
-            if wp is None or wp <= 0:
-                return None
-            weth_spent = _dec(max(0, -weth_del.get(payer, 0)), 18)
-            spent_usd = weth_spent * float(wp)
-            eth_spent_total = weth_spent
-
-        if spent_usd <= 0:
-            return None
-
-    total_usd = spent_usd
-
-    # Coherence filter to kill false positives.
-    # Skip for native-ETH buys: token price estimates can drift and should not block valid buys.
-    if (not paid_with_eth) and usd_est > 0 and spent_usd > 0:
-        if spent_usd < usd_est * 0.20:
-            return None
-        if spent_usd > usd_est * 5.0:
-            return None
-
+    row = j["data"][0]
+    record_date = row.get("record_date") or ""
+    amt_str = row["tot_pub_debt_out_amt"]
+    debt_int = int(float(amt_str))
     return {
-        "buyer": buyer,
-        "usd": float(total_usd),
-        "tokens": float(tokens_bought),
-        "eth": float(eth_spent_total),
-        "pay": {"eth": float(eth_spent_total), "usdc": float(usdc_spent), "usdt": float(usdt_spent), "weth": float(weth_spent)},
+        "record_date": record_date,
+        "debt": debt_int,
+        "fetched_at": utc_now_iso(),
+        "source": "treasury_fiscaldata_debt_to_penny",
     }
 
 
+def estimate_rate_per_second_from_history() -> float:
+    data = load_history()
+    snaps = data.get("debt_snapshots", [])
+    if len(snaps) < 2:
+        return 0.0
 
-def _max_inflow_addr(deltas_for_token: Dict[str, int]) -> Tuple[Optional[str], int]:
-    best_addr = None
-    best_in = 0
-    for addr, d in (deltas_for_token or {}).items():
-        if d > 0 and d > best_in:
-            best_in = d
-            best_addr = addr
-    return best_addr, best_in
-
-
-def _pick_final_seller(token_deltas: Dict[str, int], exclude_addrs: List[str]) -> Optional[str]:
-    exclude = set(_norm(a) for a in exclude_addrs if a)
-    best_addr = None
-    best_out = 0
-    for addr, delta in token_deltas.items():
-        if addr in exclude:
+    # Find last two snapshots with different record_date and valid debt
+    last = None
+    prev = None
+    for s in reversed(snaps):
+        if not isinstance(s, dict):
             continue
-        if delta < 0 and (-delta) > best_out:
-            best_out = -delta
-            best_addr = addr
-    return best_addr
-
-
-def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if _receipt_has_ignored_erc721(receipt):
-        return None
-
-    # Use the receipt block number for historic Chainlink reads (eth_call at that block)
-    block_number = None
-    try:
-        bn_hex = receipt.get("blockNumber")
-        if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
-            block_number = int(bn_hex, 16)
-    except Exception:
-        block_number = None
-
-    token_addresses = {
-        TOKEN_ADDRESS: TOKEN_DECIMALS,
-        USDC_ADDRESS: 6,
-        USDT_ADDRESS: 6,
-        WETH_ADDRESS: 18,
-    }
-
-    deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
-    tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
-    if not tdel:
-        return None
-
-    exclude = [
-        TOKEN_ADDRESS,
-        USDC_ADDRESS,
-        USDT_ADDRESS,
-        WETH_ADDRESS,
-        BURN_ADDRESS,
-        STAKING_CONTRACT_ADDRESS,
-    ]
-
-    seller = _pick_final_seller(tdel, exclude)
-    if not seller:
-        return None
-
-    tokens_delta_int = int(tdel.get(seller, 0))
-    if tokens_delta_int >= 0:
-        return None
-
-    tokens_sold = _dec(-tokens_delta_int, TOKEN_DECIMALS)
-
-    # Price estimate for sanity filtering
-    state = _load_state()
-    cache = state.get("cache") or {}
-    state["cache"] = cache
-
-    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-    if price is not None:
-        cache["token_price_usd"] = float(price)
-    else:
-        price = cache.get("token_price_usd")
-
-    _save_state(state)
-
-    usd_est = (float(price) if price is not None else 0.0) * float(tokens_sold)
-
-    usdc_del = deltas.get(_norm(USDC_ADDRESS)) or {}
-    usdt_del = deltas.get(_norm(USDT_ADDRESS)) or {}
-    weth_del = deltas.get(_norm(WETH_ADDRESS)) or {}
-
-    recv_usdc, usdc_in = _max_inflow_addr(usdc_del)
-    recv_usdt, usdt_in = _max_inflow_addr(usdt_del)
-    recv_weth, weth_in = _max_inflow_addr(weth_del)
-
-    receiver = None
-    got_usd = 0.0
-
-    # Prefer stablecoin inflow
-    if usdc_in > 0 or usdt_in > 0:
-        receiver = recv_usdc if usdc_in >= usdt_in else recv_usdt
-        if receiver:
-            got_usd += _dec(max(0, usdc_del.get(receiver, 0)), 6)
-            got_usd += _dec(max(0, usdt_del.get(receiver, 0)), 6)
-
-    # Fallback: WETH inflow
-    if got_usd <= 0 and weth_in > 0 and recv_weth:
-        receiver = recv_weth
-        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback) or 0.0
-        got_usd += _dec(max(0, weth_del.get(receiver, 0)), 18) * wp
-
-    # Add ETH received only if tx.to is seller? Hard to do reliably. Skip to avoid false positives.
-
-    if got_usd <= 0:
-        return None
-
-    total_usd = got_usd
-
-    # Coherence filter
-    if usd_est > 0 and got_usd > 0:
-        if got_usd < usd_est * 0.20:
-            return None
-        if got_usd > usd_est * 5.0:
-            return None
-
-    return {
-        "seller": seller,
-        "usd": float(total_usd),
-        "tokens": float(tokens_sold),
-    }
-
-
-# =========================
-# Stake and burn detection
-# =========================
-
-def _classify_transfer_log(log: Dict[str, Any]) -> Optional[Tuple[str, str, str, int]]:
-    # Only classify stake or burn when the Transfer log belongs to the CLAWD token contract
-    if _norm(log.get("address", "")) != _norm(TOKEN_ADDRESS):
-        return None
-
-    topics = log.get("topics") or []
-    if len(topics) < 3:
-        return None
-    if _norm(topics[0]) != TRANSFER_TOPIC0:
-        return None
-
-    from_addr = _norm(_topic_addr(topics[1]))
-    to_addr = _norm(_topic_addr(topics[2]))
-    amount_int = int(log.get("data", "0x0"), 16)
-
-    if STAKING_CONTRACT_ADDRESS and to_addr == _norm(STAKING_CONTRACT_ADDRESS):
-        return ("stake", from_addr, to_addr, amount_int)
-
-    if to_addr == _norm(BURN_ADDRESS):
-        return ("burn", from_addr, to_addr, amount_int)
-
-    return None
-
-
-# =========================
-# Telegram helpers
-# =========================
-
-async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> None:
-    path = None
-    if kind == "buy":
-        path = ASSET_BUY
-    elif kind == "stake":
-        path = ASSET_STAKE
-    elif kind == "burn":
-        path = ASSET_BURN
-
-    if path and os.path.exists(path):
-        with open(path, "rb") as f:
-            await app.bot.send_photo(
-                chat_id=chat_id,
-                photo=f,
-                caption=caption,
-                parse_mode="HTML",
-            )
-    else:
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-
-
-def _payment_line(kind: str, pay: Optional[Dict[str, float]]) -> str:
-    """Format the payment section for buy alerts.
-
-    Rules:
-    - Only for kind == "buy".
-    - Show ETH line if eth > 0.
-    - Show USDC/USDT line if spent > 0.
-    - Always end with a newline so the following Wallet line stays on its own line.
-    """
-    if kind != "buy" or not pay:
-        return ""
-
-    lines: List[str] = []
-    eth = float(pay.get("eth") or 0.0)
-    usdc = float(pay.get("usdc") or 0.0)
-    usdt = float(pay.get("usdt") or 0.0)
-
-    if eth > 0:
-        lines.append(f"ETH: {eth:.2f}")
-    if usdc > 0:
-        lines.append(f"USDC: {int(round(usdc)):,}")
-    if usdt > 0:
-        lines.append(f"USDT: {int(round(usdt)):,}")
-
-    if not lines:
-        return ""
-    return "\n".join(lines) + "\n"
-
-
-def _event_caption(
-    kind: str,
-    tx_hash: str,
-    amount_tokens: float,
-    usd: float,
-    wallet_addr: str,
-    pay: Optional[Dict[str, float]] = None
-) -> str:
-
-    state = _load_state()
-    usd_per_emoji = float(state["emoji_usd"][kind])
-
-    if kind == "buy":
-        title = "CLAWD BOUGHT!"
-        emoji = LOBSTER
-    elif kind == "stake":
-        title = "CLAWD STAKED!"
-        emoji = "🔒"
-    else:
-        title = "CLAWD BURNED!"
-        emoji = "🔥"
-
-    bar = _emoji_bar(usd, usd_per_emoji, emoji)
-
-    tx_url = f"https://basescan.org/tx/{tx_hash}"
-    wallet_url = f"https://basescan.org/address/{wallet_addr}"
-
-    caption = (
-        f"<b>{title}</b>\n\n"
-        f"{bar}\n\n"
-        f'CLAWD: {_fmt_token_amount(amount_tokens)} ({_fmt_int_usd(usd)}) (<a href="{tx_url}">Tx</a>)\n'
-        + (_payment_line(kind, pay) if kind == "buy" else "")
-        + f'Wallet: <a href="{wallet_url}">{_short_addr(wallet_addr)}</a>'
-    )
-
-    return caption
-
-
-async def _dm_user(app, user_id: int, text: str) -> bool:
-    try:
-        await app.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True)
-        return True
-    except Exception:
-        return False
-
-
-def _help_text() -> str:
-    lines = []
-    lines.append("Commands")
-    lines.append("")
-    lines.append("/help")
-    lines.append("Show this message")
-    lines.append("")
-    lines.append("/stats")
-    lines.append("Show price, market cap, wallet balances, and burned stats")
-    lines.append("")
-    lines.append("/scan <blocks_back> <min_buy_usd>")
-    lines.append("Scan last N blocks and DM you the buys above the threshold")
-    lines.append("Example: /scan 5000 2000")
-    lines.append("")
-    lines.append("/setmin <buy|stake|burn> <usd>")
-    lines.append("Set minimum USD size per event type")
-    lines.append("")
-    lines.append("/setemoji <buy|stake|burn> <usd_per_emoji>")
-    lines.append("Set USD value per lobster emoji (max 100 emojis)")
-    lines.append("")
-    lines.append("/alerts on|off")
-    lines.append("Enable or disable DM alerts to the admin")
-    lines.append("")
-    lines.append("/cancel")
-    lines.append("Cancel any running tasks")
-    return "\n".join(lines)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    await update.message.reply_text(_help_text())
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    await update.message.reply_text("Bot is running. Use /help")
-
-
-# =========================
-# Commands
-# =========================
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    cancelled = 0
-    had_monitor = False
-
-    for name, ev in list(TASK_CANCEL_EVENTS.items()):
-        try:
-            ev.set()
-        except Exception:
-            pass
-
-    for name, task in list(TASK_REGISTRY.items()):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-            if name == "monitor":
-                had_monitor = True
-
-    await update.message.reply_text(f"Cancelled {cancelled} task(s).")
-
-    if had_monitor:
-        try:
-            _track_task("monitor", asyncio.create_task(monitor(context.application)))
-            await update.message.reply_text("Monitor restarted.")
-        except Exception:
-            pass
-
-
-async def cmd_setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Not allowed.")
-        return
-
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /setmin <buy|stake|burn> <usd>")
-        return
-
-    kind = context.args[0].strip().lower()
-    if kind not in ("buy", "stake", "burn"):
-        await update.message.reply_text("Kind must be buy, stake, or burn.")
-        return
+        if "debt" not in s or "record_date" not in s or "fetched_at" not in s:
+            continue
+        if last is None:
+            last = s
+            continue
+        if s.get("record_date") != last.get("record_date"):
+            prev = s
+            break
+
+    if not last or not prev:
+        return 0.0
 
     try:
-        usd = float(context.args[1])
-    except Exception:
-        await update.message.reply_text("Invalid usd.")
-        return
-
-    state = _load_state()
-    state["min_usd"][kind] = max(0.0, usd)
-    _save_state(state)
-    await update.message.reply_text(f"OK. min_usd[{kind}] = {state['min_usd'][kind]}")
-
-
-async def cmd_setemoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Not allowed.")
-        return
-
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /setemoji <buy|stake|burn> <usd_per_emoji>")
-        return
-
-    kind = context.args[0].strip().lower()
-    if kind not in ("buy", "stake", "burn"):
-        await update.message.reply_text("Kind must be buy, stake, or burn.")
-        return
-
-    try:
-        usd_per = float(context.args[1])
-    except Exception:
-        await update.message.reply_text("Invalid usd_per_emoji.")
-        return
-
-    state = _load_state()
-    state["emoji_usd"][kind] = max(0.01, usd_per)
-    _save_state(state)
-    await update.message.reply_text(f"OK. emoji_usd[{kind}] = {state['emoji_usd'][kind]}")
-
-
-async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Not allowed.")
-        return
-
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /alerts on|off")
-        return
-
-    arg = context.args[0].strip().lower()
-    if arg not in ("on", "off"):
-        await update.message.reply_text("Usage: /alerts on|off")
-        return
-
-    state = _load_state()
-    state["alerts_dm"] = (arg == "on")
-    _save_state(state)
-
-    await update.message.reply_text(f"OK. DM alerts {'ON' if state['alerts_dm'] else 'OFF'}.")
-
-
-async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> None:
-    # This scan runs in a thread but sends progress in realtime via run_coroutine_threadsafe
-    loop = asyncio.get_running_loop()
-
-    def _send_dm(text: str) -> None:
-        fut = asyncio.run_coroutine_threadsafe(
-            app.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True),
-            loop
-        )
-        try:
-            fut.result(timeout=15)
-        except Exception:
-            pass
-
-    def _run_scan_sync() -> None:
-        t0 = time.time()
-        _send_dm(f"Scan started. blocks_back={blocks_back} min_usd={_fmt_usd_compact(min_usd)}")
-
-        latest = _get_latest_block()
-        end = latest - max(0, WATCH_CONFIRMATIONS)
-        if end < 0:
-            end = 0
-        start = max(0, end - blocks_back + 1)
-
-        _send_dm(f"Range: {start} to {end}. Fetching logs...")
-        logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
-        _send_dm(f"Logs: {len(logs):,}. Building tx list...")
-
-        tx_hashes: List[str] = []
-        seen_tx = set()
-        for lg in logs:
-            h = lg.get("transactionHash")
-            if not h or h in seen_tx:
-                continue
-            seen_tx.add(h)
-            tx_hashes.append(h)
-
-        _send_dm(f"Unique txs: {len(tx_hashes):,}. Fetching receipts...")
-
-        matches: List[Tuple[str, Dict[str, Any]]] = []
-        ok = 0
-        fail = 0
-
-        for i, h in enumerate(tx_hashes, start=1):
-            try:
-                receipt = _get_receipt(h)
-                ok += 1
-                buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
-                if buy and float(buy["usd"]) >= min_usd:
-                    matches.append((h, buy))
-            except Exception:
-                fail += 1
-
-            if i % 200 == 0:
-                _send_dm(
-                    f"Progress: {i:,}/{len(tx_hashes):,} ok={ok:,} fail={fail:,} "
-                    f"matches={len(matches):,} elapsed={time.time()-t0:.1f}s"
-                )
-
-        matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
-
-        lines: List[str] = []
-        lines.append("Scan finished")
-        lines.append(f"Blocks: {blocks_back} (from {start} to {end})")
-        lines.append(f"Logs: {len(logs):,}")
-        lines.append(f"Unique txs: {len(tx_hashes):,}")
-        lines.append(f"Receipts ok: {ok:,}")
-        lines.append(f"Receipts failed: {fail:,}")
-        lines.append(f"Matches (>= {_fmt_usd_compact(min_usd)}): {len(matches):,}")
-        lines.append(f"Time: {time.time()-t0:.1f}s")
-
-        if not matches:
-            _send_dm("\n".join(lines))
-            return
-
-        state = _load_state()
-        usd_per_emoji = float(state["emoji_usd"]["buy"])
-
-        lines.append("")
-        lines.append("Top results (max 20):")
-
-        for h, buy in matches[:20]:
-            usd = float(buy["usd"])
-            tokens = float(buy["tokens"])
-            buyer = buy["buyer"]
-            bar = _emoji_bar(usd, usd_per_emoji)
-
-            lines.append("")
-            lines.append(f"{bar} {_fmt_usd_compact(usd)}")
-            lines.append(f"Buyer: {buyer}")
-            lines.append(f"Tokens: {int(round(tokens)):,} CLAWD")
-            lines.append(f"Tx: https://basescan.org/tx/{h}")
-
-        _send_dm("\n".join(lines))
-
-    await asyncio.to_thread(_run_scan_sync)
-
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-
-    user_id = update.effective_user.id
-
-    # Mode 1: scan a single transaction hash and send the corresponding alert (buy/stake/burn).
-    if len(context.args) == 1:
-        tx_hash = context.args[0].strip()
-
-        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
-            await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>  OR  /scan <tx_hash>")
-            return
-
-        await update.message.reply_text("Scanning tx hash...")
-
-        try:
-            receipt = _get_receipt(tx_hash)
-            if not receipt:
-                await update.message.reply_text("Transaction not found (no receipt).")
-                return
-        except Exception:
-            await update.message.reply_text("Failed to fetch receipt for this tx.")
-            return
-
-        # 1) Try BUY
-        buy = None
-        try:
-            buy = _buy_from_receipt(tx_hash, receipt)
-        except Exception:
-            buy = None
-
-        if buy:
-            caption = _event_caption(
-                "buy",
-                tx_hash,
-                float(buy["tokens"]),
-                float(buy["usd"]),
-                str(buy["buyer"]),
-                pay=buy.get("pay"),
-            )
-            await _send_photo_or_text(context.application, user_id, "buy", caption)
-            await update.message.reply_text("Buy alert sent in DM.")
-            return
-
-        # 2) If not a buy, try stake/burn based on Transfer logs.
-        # For /scan <tx_hash>, we send alerts regardless of your min_usd thresholds.
-        try:
-            price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-
-            if price is None:
-                st = _load_state()
-                cache = st.get("cache") or {}
-                price = cache.get("token_price_usd")
-
-            token_price = float(price or 0.0)
-
-            detected: List[str] = []
-
-            for lg in (receipt.get("logs") or []):
-                classified = _classify_transfer_log(lg)
-                if not classified:
-                    continue
-
-                kind, from_addr, _to_addr, amount_int = classified
-                if kind not in ("stake", "burn"):
-                    continue
-
-                amount = _dec(amount_int, TOKEN_DECIMALS)
-                usd = amount * token_price
-
-                caption = _event_caption(kind, tx_hash, float(amount), float(usd), str(from_addr))
-                await _send_photo_or_text(context.application, user_id, kind, caption)
-                detected.append(kind)
-
-            if detected:
-                kinds = ", ".join(sorted(set(detected)))
-                await update.message.reply_text(f"{kinds.capitalize()} alert sent in DM.")
-                return
-        except Exception:
-            pass
-
-        # Optional: detect if it's a sell, just to report correctly
-        sell = None
-        try:
-            sell = _sell_from_receipt(tx_hash, receipt)
-        except Exception:
-            sell = None
-
-        if sell:
-            await update.message.reply_text("That tx looks like a SELL. This command only sends alerts for buys.")
-        else:
-            await update.message.reply_text("That tx is not detected as a buy, stake, or burn (no alert sent).")
-        return
-
-    # Mode 2: scan a block range for buys
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /scan <blocks_back> <min_buy_usd>")
-        return
-
-    try:
-        blocks_back = int(context.args[0])
-        min_usd = float(context.args[1])
-    except Exception:
-        await update.message.reply_text("Invalid args. Example: /scan 5000 2000")
-        return
-
-    if blocks_back < 1:
-        blocks_back = 1
-    if blocks_back > 20000:
-        blocks_back = 20000
-
-    await update.message.reply_text(
-        f"Scanning last {blocks_back} blocks for buys >= {_fmt_usd_compact(min_usd)}. Check your DM."
-    )
-
-    _track_task(
-        f"scan:{update.effective_user.id}",
-        asyncio.create_task(_scan_and_dm(context.application, update.effective_user.id, blocks_back, min_usd)),
-    )
-
-
-CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
-
-_SEL_DECIMALS = "0x313ce567"
-_SEL_LATEST_ROUND = "0xfeaf968c"
-
-def _rpc_eth_call(to_addr: str, data_hex: str) -> str:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": [{"to": to_addr, "data": data_hex}, "latest"],
-    }
-    r = requests.post(BASE_RPC_URL, json=payload, timeout=10)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(j["error"])
-    return j["result"]
-
-def _abi_int256(word_hex: str) -> int:
-    # word_hex is a 32 byte hex string like "0x" + 64 hex chars
-    x = int(word_hex, 16)
-    if x >= 1 << 255:
-        x -= 1 << 256
-    return x
-
-def _get_eth_price_now() -> float:
-    """
-    Reads ETH/USD from Chainlink on Base via your Ankr Base RPC.
-    No Dexscreener dependency.
-    """
-    try:
-        dec_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_DECIMALS)
-        decimals = int(dec_raw, 16)
-
-        lr_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_LATEST_ROUND)
-        if not lr_raw or lr_raw == "0x":
-            return 0.0
-
-        # latestRoundData() returns 5 words (32 bytes each). The answer is the 2nd word.
-        data = lr_raw[2:].rjust(64 * 5, "0")
-        answer_word = "0x" + data[64:128]
-        answer = _abi_int256(answer_word)
-
-        if answer <= 0:
-            return 0.0
-
-        return float(answer) / (10 ** decimals)
+        last_date = datetime.fromisoformat(last["fetched_at"])
+        prev_date = datetime.fromisoformat(prev["fetched_at"])
     except Exception:
         return 0.0
 
+    dt = (last_date - prev_date).total_seconds()
+    if dt <= 0:
+        return 0.0
+
+    delta = int(last["debt"]) - int(prev["debt"])
+    return float(delta) / float(dt)
 
 
-# =========================
-# Basescan helpers
-# =========================
 
-_HOLDERS_CACHE: Dict[str, Dict[str, Any]] = {}  # token -> {ts, count}
+def inflation_loss(amount: int, annual_rate: float) -> tuple[int, int, int]:
+    daily = amount * (annual_rate / 365.0)
+    monthly = amount * (annual_rate / 12.0)
+    return int(daily), int(monthly)
 
-def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
-    """
-    Return current holder count for an ERC-20 token on Base.
 
-    1) Try Etherscan v2 tokenholdercount (PRO on many plans).
-    2) Fallback: scrape basescan.org/token/<addr> by stripping HTML to text and regexing "Holders <num>".
+def is_allowed_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    if not chat:
+        return False
+    return chat.type == "private" or ALLOWED_CHAT_ID == 0 or chat.id == ALLOWED_CHAT_ID
 
-    Cache TTL: 60 minutes (in-memory).
-    Env key name: ETHERSCAN_APIKEY
-    """
+
+
+
+
+
+
+async def debt_or_inflation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_chat(update):
+        return
+
+    msg = update.message
+    if not msg:
+        return
+
+    chat = update.effective_chat
+    scope = "private" if chat.type == "private" else "public"
+    cycle = debt_cycles[scope]
+
+    now = time.time()
+
+    # -------------------------------------------------
+    # Fetch current debt
+    # -------------------------------------------------
+    try:
+        latest = fetch_latest_us_debt()
+    except Exception:
+        await msg.reply_text("Error fetching US debt data.")
+        return
+
+    append_debt_snapshot(latest)
+
+    debt_now = latest["debt"]
+    debt_fmt = fmt_usd_int(debt_now)
+
+    daily_loss, monthly_loss = inflation_loss(100_000, ANNUAL_INFLATION)
+    yearly_loss = int(100_000 * ANNUAL_INFLATION)
+    loss_since_2020 = int(100_000 * BASE_LOSS_SINCE_2020)
+
+    caption = (
+        f"🇺🇸 US NATIONAL DEBT\n"
+        f"{debt_fmt}\n\n"
+        f"📉 Annual inflation: {ANNUAL_INFLATION*100:.1f}%\n\n"
+        f"The disastrous effects:\n\n"
+        f"$100,000 right now will lose...\n\n"
+        f"<pre>"
+        f"{fmt_usd_int(daily_loss):<10} today\n"
+        f"{fmt_usd_int(monthly_loss):<10} in one month\n"
+        f"{fmt_usd_int(yearly_loss):<10} in one year\n"
+        f"{fmt_usd_int(loss_since_2020):<10} since 2020 alone\n"
+        f"</pre>\n\n"
+        f"Your wealth is melting as we speak!\n\n"
+        f"Embrace the Unstable ⚡️\n\n"
+        f"PS. Reply to this msg with a specific year and I'll show you something else..."
+    )
+
+
+    sent = await msg.reply_photo(
+        photo=MEME_BYTES["debt_main"],
+        caption=caption,
+        parse_mode="HTML"
+    )
+
+
+
+    # -------------------------------------------------
+    # Decide whether to schedule updates
+    # -------------------------------------------------
+    if scope == "public":
+        if now - cycle["last_ts"] < DEBT_UPDATE_LOCK_SECONDS:
+            return
+
+    cycle["last_ts"] = now
+    cycle["cycle_id"] += 1
+    cycle_id = cycle["cycle_id"]
+
+    for delay, label in (
+        (300, "5 MIN UPDATE"),
+        (3600, "1 HOUR UPDATE"),
+        (86400, "24 HOUR UPDATE"),
+    ):
+        context.application.create_task(
+            debt_update_after_delay(
+                context=context,
+                chat_id=sent.chat_id,
+                reply_to_message_id=sent.message_id,
+                initial_debt=debt_now,
+                initial_record_date=latest.get("record_date", ""),
+                delay=delay,
+                label=label,
+                cycle_id=cycle_id,
+                scope=scope,
+            )
+        )
+
+
+
+
+
+
+
+async def debt_update_after_delay(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reply_to_message_id: int,
+    initial_debt: int,
+    initial_record_date: str,
+    delay: int,
+    label: str,
+    cycle_id: int,
+    scope: str,
+):
+    await asyncio.sleep(delay)
+
+    # ❌ Cancel silently if cycle was reset or replaced
+    if cycle_id != debt_cycles[scope]["cycle_id"]:
+        return
+
+    try:
+        latest = fetch_latest_us_debt()
+        append_debt_snapshot(latest)
+        new_debt = latest["debt"]
+        new_record_date = latest.get("record_date", "")
+    except Exception:
+        return
+
+    growth = new_debt - initial_debt
+    used_estimate = False
+
+    # Treasury didn't move → estimate
+    if new_record_date == initial_record_date and growth == 0:
+        rate = estimate_rate_per_second_from_history()
+        if rate <= 0:
+            rate = FALLBACK_DEBT_GROWTH_PER_SECOND
+
+        growth = int(rate * delay)
+        new_debt = initial_debt + growth
+        used_estimate = True
+
+    # -----------------------------
+    # Human-readable time line
+    # -----------------------------
+    if label.startswith("5"):
+        time_line = "in just 5 minutes."
+    elif label.startswith("1 HOUR"):
+        time_line = "in just 1 hour."
+    elif label.startswith("24"):
+        time_line = "in just 24 hours."
+    else:
+        time_line = ""
+
+    caption = (
+        f"⏱ {label}\n\n"
+        f"US National Debt now:\n"
+        f"{fmt_usd_int(new_debt)}\n\n"
+        f"Grown by:\n"
+        f"{fmt_usd_int(growth)}\n"
+        f"{time_line}\n\n"
+        f"Money printer go brrr"
+    )
+
+
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=MEME_BYTES["debt_update"],
+        caption=caption,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+    # 🔓 Release lock only for public cycles
+    if label == "24 HOUR UPDATE" and scope == "public":
+        debt_cycles["public"]["last_ts"] = time.time()
+
+
+def generate_inflation_chart(
+    start_year: int,
+    start_amount: int,
+    end_year: int,
+    end_amount: int,
+):
+    years = [start_year]
+    values = [start_amount]
+
+    base_cpi = CPI_TABLE[start_year]
+    span = end_year - start_year
+
+    for frac in (0.25, 0.5, 0.75):
+        y = int(start_year + span * frac)
+
+        nearest = max(k for k in CPI_TABLE if k <= y)
+        cpi_y = CPI_TABLE[nearest]
+
+        val = int(start_amount * (base_cpi / cpi_y))
+        years.append(y)
+        values.append(val)
+
+    years.append(end_year)
+    values.append(end_amount)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    ax.plot(years, values, linewidth=2)
+    ax.scatter(years, values, zorder=3)
+
+    ax.set_title("Purchasing Power of $100,000", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("USD equivalent")
+
+    # 👉 margen superior dinámico (20%)
+    max_val = max(values)
+    ax.set_ylim(0, max_val * 1.25)
+
+    ax.ticklabel_format(style="plain", axis="y")
+
+    for x, v in zip(years, values):
+        ax.annotate(
+            f"${v:,}",
+            (x, v),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                fc="white",
+                ec="#cfcfcf",
+                lw=0.8,
+                alpha=0.95,
+            ),
+            zorder=4,
+        )
+
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=160)
+    buf.seek(0)
+    plt.close(fig)
+
+    return buf
+
+
+
+
+
+
+
+async def year_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_chat(update):
+        return
+
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+
+    raw = (msg.text or "").strip()
+    if not raw.isdigit():
+        return
+
+    year = int(raw)
+    current_year = datetime.now().year
+
+    # -------------------------------------------------
+    # Range validation
+    # -------------------------------------------------
+    if year < 1800 or year > current_year:
+        await msg.reply_text(
+            "Year out of range. Available data starts at 1800."
+        )
+        return
+
+    # -------------------------------------------------
+    # CPI availability check (nearest year <= requested)
+    # -------------------------------------------------
+    available_years = [y for y in CPI_TABLE if y <= year]
+    if not available_years:
+        await msg.reply_text(
+            "I do not have CPI data for that year. Available from 1800 onwards."
+        )
+        return
+
+    nearest_year = max(available_years)
+
+    start_amount = 100_000
+    today_year = 2025
+
+    past_cpi = CPI_TABLE[nearest_year]
+    today_cpi = CPI_TABLE[today_year]
+
+    equivalent = int(start_amount * (past_cpi / today_cpi))
+
+    # -------------------------------------------------
+    # Chart generation (CRASH-SAFE)
+    # -------------------------------------------------
+    try:
+        chart = generate_inflation_chart(
+            start_year=year,
+            start_amount=start_amount,
+            end_year=today_year,
+            end_amount=equivalent,
+        )
+    except Exception:
+        await msg.reply_text(
+            "Something went wrong generating the chart. Please try another year."
+        )
+        return
+
+    note = ""
+    if nearest_year != year:
+        note = f"\n(CPI adjusted using {nearest_year} data)"
+
+    caption = (
+        f"$100,000 in {year} ≈ {fmt_usd_int(equivalent)} today{note}\n\n"
+        f"Get out of the fiat scam asap!!\n\n"
+        f"Embrace the Unstable ⚡️"
+    )
+
+    await context.bot.send_photo(
+        chat_id=msg.chat_id,
+        photo=chart,
+        caption=caption,
+        reply_to_message_id=msg.message_id,
+    )
+
+
+
+
+
+
+
+async def reset_debt_cycle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user = update.effective_user
+
+    # 🔒 SOLO ADMIN
+    if not user or user.id != ADMIN_ID:
+        return
+
+    # 🔄 RESET PRIVATE
+    debt_cycles["private"]["last_ts"] = 0
+    debt_cycles["private"]["cycle_id"] += 1
+
+    # 🔄 RESET PUBLIC
+    debt_cycles["public"]["last_ts"] = 0
+    debt_cycles["public"]["cycle_id"] += 1
+
+    await update.message.reply_text(
+        "✅ Debt cycles reset.\nPrivate and public updates cleared."
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==== Helpers ====
+
+def pretty(n: float) -> str:
+    if n >= 1e9:
+        s = f"{n/1e9:.2f}".rstrip("0").rstrip(".")
+        return f"{s}B"
+    if n >= 1e6:
+        s = f"{n/1e6:.2f}".rstrip("0").rstrip(".")
+        return f"{s}M"
+    return f"{n:,.0f}"
+
+def draw_center_text_fit(ax, text: str, inner_radius=0.65, max_frac=0.85, weight="bold"):
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    lo, hi = 6, 64
+    best = lo
+
+    (x1, _y) = ax.transData.transform((-inner_radius, 0))
+    (x2, _y) = ax.transData.transform((inner_radius, 0))
+    avail_px = (x2 - x1) * max_frac
+
+    for _ in range(12):
+        mid = (lo + hi) // 2
+        t = ax.text(0, 0, text, ha="center", va="center", fontsize=mid, fontweight=weight)
+        bb = t.get_window_extent(renderer=renderer)
+        t.remove()
+
+        if bb.width <= avail_px:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    ax.text(0, 0, text, ha="center", va="center", fontsize=best, fontweight=weight)
+
+def draw_legend_under(ax, labels, values, colors, y0=-0.14, line_h=0.08, font_size=12, total=None, text_color="#333"):
+    if total is None:
+        total = sum(values) if sum(values) > 0 else 1.0
+
+    for i, (lbl, v, col) in enumerate(zip(labels, values, colors)):
+        y = y0 - i * line_h
+
+        ax.add_patch(Rectangle(
+            (0.03, y - 0.018), 0.025, 0.025,
+            transform=ax.transAxes,
+            clip_on=False,
+            facecolor=col,
+            edgecolor="none"
+        ))
+
+        ax.text(0.08, y, lbl, transform=ax.transAxes, ha="left", va="center",
+                fontsize=font_size, color=text_color)
+        ax.text(0.95, y, f"{pretty(v)} ({(v/total*100):.1f}%)", transform=ax.transAxes,
+                ha="right", va="center", fontsize=font_size, color=text_color)
+
+def fetch_supply_data():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TurboBot/1.0; +https://turbousd.com)"
+    }
+    r = requests.get(SUPPLY_DATA_URL, headers=headers, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+# ==== Figure generators ====
+
+def generate_stats_combo_image():
+    j = fetch_supply_data()
+    staking = j["staking_adjusted"]
+    treasury = j["treasury"]
+    burned = j["burned"]
+    remaining = max(TOTAL_SUPPLY - (staking + treasury + burned), 0)
+
+    circulating = j["circulating"]
+    in_contracts = j["inContracts"]
+
+    fig, (axL, axR) = plt.subplots(nrows=1, ncols=2, figsize=(12, 6))
+    plt.subplots_adjust(top=0.84, bottom=0.38, wspace=0.25)
+
+    # Left chart
+    left_values = [staking, treasury, burned, remaining]
+    left_labels = ["Staking", "Treasury", "Burned", "Remaining"]
+    left_colors_wedges = [COLOR_STAKING, COLOR_TREASURY, COLOR_BURNED, COLOR_REMAINING_WEDGE]
+    left_colors_legend = [COLOR_STAKING, COLOR_TREASURY, COLOR_BURNED, COLOR_REMAINING_LEGEND]
+
+    axL.pie(left_values, colors=left_colors_wedges, startangle=90, wedgeprops=dict(width=0.35))
+    axL.set(aspect="equal")
+    axL.set_title("Supply Distribution", fontsize=18, fontweight="bold", pad=16)
+    draw_legend_under(axL, left_labels, left_values, left_colors_legend)
+
+    # Right chart
+    right_values = [circulating, in_contracts, burned]
+    right_labels = ["Circululating", "In Contracts", "Burned"]
+    right_colors_wedges = [COLOR_TRADEABLE_WEDGE, COLOR_CONTRACTS_WEDGE, COLOR_BURNED]
+    right_colors_legend = [COLOR_TRADEABLE_WEDGE, COLOR_CONTRACTS_LEGEND, COLOR_BURNED]
+
+    axR.pie(right_values, colors=right_colors_wedges, startangle=90, wedgeprops=dict(width=0.35))
+    axR.set(aspect="equal")
+    axR.set_title("Supply Status", fontsize=18, fontweight="bold", pad=16)
+
+    center_text = f"{round(circulating/1e9)}B/100B"
+    draw_center_text_fit(axR, center_text)
+
+    draw_legend_under(axR, right_labels, right_values, right_colors_legend)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=170)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+def generate_circulating_donut():
+    j = fetch_supply_data()
+    circulating = j["circulating"]
+    in_contracts = j["inContracts"]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.pie(
+        [circulating, in_contracts, j["burned"]],
+        colors=[COLOR_TRADEABLE_WEDGE, COLOR_CONTRACTS_WEDGE, COLOR_BURNED],
+        startangle=90,
+        wedgeprops=dict(width=0.35)
+    )
+    ax.set(aspect="equal")
+    draw_center_text_fit(ax, f"{round(circulating/1e9)}B/100B")
+    ax.set_title("Supply Status", fontsize=18, fontweight="bold", pad=16)
+
+    handles = [
+        Line2D([0], [0], marker="s", linestyle="none", markersize=12, markerfacecolor=COLOR_TRADEABLE_WEDGE),
+        Line2D([0], [0], marker="s", linestyle="none", markersize=12, markerfacecolor=COLOR_CONTRACTS_WEDGE),
+        Line2D([0], [0], marker="s", linestyle="none", markersize=12, markerfacecolor=COLOR_BURNED)
+    ]
+    ax.legend(handles, ["Circulating", "In Contracts", "Burned"],
+              loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=3, frameon=False)
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ==== Telegram commands ====
+
+_PRICE_CACHE = {"ts": 0, "price": 0, "fdv": 0}
+_HOLDERS_CACHE = {}
+
+
+def _dex_price_fdv(token: str):
+    try:
+        import time
+        import requests
+
+        if time.time() - _PRICE_CACHE["ts"] < 60:
+            return _PRICE_CACHE["price"], _PRICE_CACHE["fdv"]
+
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token}", timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        pairs = j.get("pairs") or []
+        if not pairs:
+            return 0.0, 0.0
+
+        pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+        p = pairs[0]
+
+        price = float(p.get("priceUsd") or 0)
+        fdv = float(p.get("fdv") or 0)
+
+        _PRICE_CACHE.update({"ts": time.time(), "price": price, "fdv": fdv})
+        return price, fdv
+    except Exception:
+        return 0.0, 0.0
+
+
+def _basescan_token_holder_count(token_addr: str):
     try:
         token = (token_addr or "").strip().lower()
         if not token or not token.startswith("0x"):
@@ -1820,21 +1025,19 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
         now = time.time()
         c = _HOLDERS_CACHE.get(token)
 
-        # Cache 60 min
         if c and (now - float(c.get("ts") or 0.0)) <= 3600:
             v = int(c.get("count") or 0)
             return v if v > 0 else None
 
-        # 1) Etherscan v2 (multichain)
         try:
             params = {
-                "chainid": 8453,  # Base mainnet
+                "chainid": 8453,
                 "module": "token",
                 "action": "tokenholdercount",
                 "contractaddress": token,
             }
-            if ETHERSCAN_APIKEY:
-                params["apikey"] = ETHERSCAN_APIKEY
+            if SCAN_APIKEY:
+                params["apikey"] = SCAN_APIKEY
 
             r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=20)
             r.raise_for_status()
@@ -1849,14 +1052,13 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
         except Exception:
             pass
 
-        # 2) Fallback: scrape Basescan token page
         try:
             url = f"https://basescan.org/token/{token}"
             r = requests.get(
                 url,
                 timeout=20,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                    "User-Agent": "Mozilla/5.0",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
                 },
@@ -1864,21 +1066,17 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
             r.raise_for_status()
             html = r.text or ""
 
-            # Remove scripts/styles to avoid fake matches
             html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
             html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
 
-            # Strip tags to text
             text = re.sub(r"(?s)<[^>]+>", " ", html)
             text = re.sub(r"\s+", " ", text).strip()
 
-            # Prefer the "Overview" area if present
             start_idx = text.lower().find("overview")
             search_space = text[start_idx:] if start_idx != -1 else text
 
             m = re.search(r"\bHolders\b\s*([0-9][0-9,]*)\b", search_space, re.IGNORECASE)
             if not m:
-                # Fallback to anywhere in page
                 m = re.search(r"\bHolders\b\s*([0-9][0-9,]*)\b", text, re.IGNORECASE)
 
             if m:
@@ -1895,692 +1093,1844 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
     return None
 
 
+def _erc20_balance_of(token: str, holder: str) -> int:
+    selector = "0x70a08231"
+    holder_padded = holder.lower().replace("0x", "").rjust(64, "0")
+    data = selector + holder_padded
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": token, "data": data}, "latest"],
+    }
+    r = requests.post(BASE_RPC_URL, json=payload, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(str(j["error"]))
+    return int(j["result"], 16)
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+
+def _staking_contract_balance() -> float:
+    try:
+        bal_int = _erc20_balance_of(
+            TUSD_CONTRACT_ADDRESS,
+            "0x2a70a42BC0524aBCA9Bff59a51E7aAdB575DC89A"
+        )
+        return bal_int / (10 ** TUSD_DECIMALS)
+    except Exception:
+        return 0.0
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    j = fetch_supply_data()
+
+    treasury = float(j.get("treasury", 0) or 0)
+    staked = float(j.get("staking_adjusted", 0) or 0)
+    burned = float(j.get("burned", 0) or 0)
+
+    treasury_pct = (treasury / TOTAL_SUPPLY * 100) if TOTAL_SUPPLY else 0
+    staked_pct = (staked / TOTAL_SUPPLY * 100) if TOTAL_SUPPLY else 0
+    burned_pct = (burned / TOTAL_SUPPLY * 100) if TOTAL_SUPPLY else 0
+
+    price, fdv = _dex_price_fdv(TUSD_CONTRACT_ADDRESS)
+
+    holders = _basescan_token_holder_count(TUSD_CONTRACT_ADDRESS)
+    holders = int(holders or 0)
+
+    staking_contract_balance = _staking_contract_balance()
+    extra_from_treasury = max(0.0, staking_contract_balance - staked)
+    extra_pct = (extra_from_treasury / TOTAL_SUPPLY * 100) if TOTAL_SUPPLY else 0
+
+    caption = (
+        f"📊 <b>₸USD Stats</b>\n"
+        f"Current price: ${price:,.8f}\n"
+        f"FDV: ${fdv:,.0f}\n"
+        f"Holders: {holders:,}\n\n"
+        f"⚡️ <b>Treasury</b>\n"
+        f"{pretty(treasury)} ₸USD (${treasury * price:,.0f} · {treasury_pct:.2f}%)\n\n"
+        f"🔒 <b>Staked</b>\n"
+        f"{pretty(staked)} ₸USD (${staked * price:,.0f} · {staked_pct:.2f}%)\n"
+        f"+{pretty(extra_from_treasury)} ₸USD from treasury (${extra_from_treasury * price:,.0f} · {extra_pct:.2f}%)\n\n"
+        f"🔥 <b>Burned</b>\n"
+        f"{pretty(burned)} ₸USD (${burned * price:,.0f} · {burned_pct:.2f}%)"
+    )
+
+    img = generate_stats_combo_image()
+
+    await update.message.reply_photo(
+        photo=img,
+        caption=caption,
+        parse_mode="HTML"
+    )
+
+async def circsupply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    image = generate_circulating_donut()
+    await update.message.reply_photo(photo=image, caption="📊 Circulating Supply Overview")
+
+
+
+def preload_memes():
+    # Base memes
+    for key, m in MEMES.items():
+        try:
+            with open(m["path"], "rb") as f:
+                MEME_BYTES[key] = f.read()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load meme {key}: {e}")
+
+    # Event images (staking and burn notifications)
+    for key, m in EVENT_IMAGES.items():
+        try:
+            with open(m["path"], "rb") as f:
+                MEME_BYTES[f"event_{key}"] = f.read()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load event image {key}: {e}")
+
+
+def generate_printer_card():
+    per_sec = FALLBACK_DEBT_GROWTH_PER_SECOND
+    per_min = per_sec * 60
+    per_day = per_sec * 86400
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    fig.patch.set_facecolor("#0f0f0f")
+    ax.set_facecolor("#0f0f0f")
+    ax.axis("off")
+
+    # -----------------------------
+    # Title
+    # -----------------------------
+    ax.text(
+        0.5, 0.86,
+        "MONEY PRINTER SPEED",
+        ha="center",
+        va="center",
+        fontsize=18,
+        fontweight="bold",
+        color="white"
+    )
+
+    block_gap = 0.25
+    label_offset = 0.085
+
+    # -----------------------------
+    # PER SECOND
+    # -----------------------------
+    y_sec = 0.67
+
+    ax.text(
+        0.5, y_sec,
+        f"${per_sec:,.0f}",
+        ha="center",
+        va="center",
+        fontsize=22,
+        fontweight="bold",
+        color="#FFD23F"
+    )
+    ax.text(
+        0.5, y_sec - label_offset,
+        "PER SECOND",
+        ha="center",
+        va="center",
+        fontsize=10,
+        color="#bbbbbb"
+    )
+
+    # -----------------------------
+    # PER MINUTE
+    # -----------------------------
+    y_min = y_sec - block_gap
+
+    ax.text(
+        0.5, y_min,
+        f"${per_min:,.0f}",
+        ha="center",
+        va="center",
+        fontsize=26,
+        fontweight="bold",
+        color="#FF9F1C"
+    )
+    ax.text(
+        0.5, y_min - label_offset,
+        "PER MINUTE",
+        ha="center",
+        va="center",
+        fontsize=10,
+        color="#bbbbbb"
+    )
+
+    # -----------------------------
+    # PER DAY
+    # -----------------------------
+    y_day = y_min - block_gap
+
+    ax.text(
+        0.5, y_day,
+        f"${per_day:,.0f}",
+        ha="center",
+        va="center",
+        fontsize=32,
+        fontweight="bold",
+        color="#FF4C4C"
+    )
+    ax.text(
+        0.5, y_day - label_offset,
+        "PER DAY",
+        ha="center",
+        va="center",
+        fontsize=10,
+        color="#bbbbbb"
+    )
+
+    # -----------------------------
+    # Footer (more space from PER DAY)
+    # -----------------------------
+    ax.text(
+        0.5, y_day - 0.26,
+        "Money printer go brrr",
+        ha="center",
+        va="center",
+        fontsize=16,
+        color="white"
+    )
+
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=170)
+    buf.seek(0)
+    plt.close(fig)
+
+    return buf
+
+
+
+
+
+
+def generate_printer_counter(elapsed_sec: int):
+    printed = int(FALLBACK_DEBT_GROWTH_PER_SECOND * elapsed_sec)
+
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    fig.patch.set_facecolor("#0f0f0f")
+    ax.set_facecolor("#0f0f0f")
+    ax.axis("off")
+
+    ax.text(
+        0.5, 0.80,
+        f"IN THE LAST {elapsed_sec} SECONDS",
+        ha="center",
+        va="center",
+        fontsize=14,
+        color="#bbbbbb",
+        fontweight="bold"
+    )
+
+    ax.text(
+        0.5, 0.48,
+        f"${printed:,.0f}",
+        ha="center",
+        va="center",
+        fontsize=42,
+        fontweight="bold",
+        color="#FF4C4C"
+    )
+
+    ax.text(
+        0.5, 0.20,
+        "added to US debt",
+        ha="center",
+        va="center",
+        fontsize=16,
+        color="white"
+    )
+
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=170)
+    buf.seek(0)
+    plt.close(fig)
+
+    return buf
+
+
+
+
+async def printer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_chat(update):
         return
 
-    state = _load_state()
-    cache = state.get("cache") or {}
-    state["cache"] = cache
+    msg = update.message
+    if not msg:
+        return
 
-    price, fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+    # 1️⃣ First message (speed card)
+    card = generate_printer_card()
+    sent = await msg.reply_photo(
+        photo=card,
+        caption="🖨️ Money printer is ON.\nWatch it closely."
+    )
 
-    # Use live ETH price for stats (WETH USD should never be historical here)
-    wp = _get_eth_price_now()
+    # 2️⃣ Second message after 30 seconds (counter)
+    async def delayed_counter():
+        await asyncio.sleep(30)
 
-    if price is not None:
-        cache["token_price_usd"] = float(price)
-    if fdv is not None:
-        cache["token_fdv"] = float(fdv)
-    if wp and wp > 0:
-        cache["eth_price_usd_now"] = float(wp)
+        counter_img = generate_printer_counter(elapsed_sec=30)
 
-    if price is None:
-        price = cache.get("token_price_usd")
-    if fdv is None:
-        fdv = cache.get("token_fdv")
-    if (not wp) or wp <= 0:
-        wp = float(cache.get("eth_price_usd_now") or 0.0)
+        await context.bot.send_photo(
+            chat_id=sent.chat_id,
+            photo=counter_img,
+            caption="⏱️ While you were reading the message above…",
+            reply_to_message_id=sent.message_id
+        )
 
-    _save_state(state)
+    context.application.create_task(delayed_counter())
 
-    clawdviction_wallet = "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
-    clawdlabs_wallet = "0x85Af18A392E564F68897A0518C191D0831e40a46"
+
+
+
+
+
+async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return
+
+    # 🔒 PRIVATE + OWNER ONLY
+    if chat.type != "private" or user.id != ADMIN_ID:
+        return
+
+    await chat.send_message("♻️ Restarting bot...")
+    await asyncio.sleep(1)
+
+    os._exit(1)  # 👈 fuerza restart del proceso
+
+
+
+
+
+
+
+
+
+
+    
+
+# ==== Onchain event watchers (staking + burn) ====
+
+def _read_watch_state() -> dict:
+    ensure_data_dir()
+    try:
+        with open(WATCH_STATE_PATH, "r", encoding="utf-8") as f:
+            j = json.load(f)
+            if not isinstance(j, dict):
+                return {}
+            return j
+    except Exception:
+        return {}
+
+def _write_watch_state(state: dict):
+    ensure_data_dir()
+    _atomic_write_json(WATCH_STATE_PATH, state)
+
+def _rpc_call(method: str, params: list) -> dict | None:
+    """
+    Basic JSON-RPC call with minimal retries.
+    Returns parsed JSON dict on success, or None on failure.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(BASE_RPC_URL, json=payload, timeout=25)
+            r.raise_for_status()
+            j = r.json()
+            # JSON-RPC can return {"error": ...}
+            if isinstance(j, dict) and j.get("error"):
+                last_err = j.get("error")
+                raise RuntimeError(f"rpc_error: {last_err}")
+            return j
+        except Exception as e:
+            last_err = str(e)
+            # small backoff
+            time.sleep(0.35 * (attempt + 1))
+
+    # Keep it silent, but print helps when you look at logs
+    try:
+        print(f"[rpc] failed method={method} err={last_err}")
+    except Exception:
+        pass
+    return None
+
+def _rpc_latest_block() -> int | None:
+    j = _rpc_call("eth_blockNumber", [])
+    if not j or "result" not in j:
+        return None
+    try:
+        return int(j["result"], 16)
+    except Exception:
+        return None
+
+
+def _rpc_get_receipt(tx_hash: str) -> dict | None:
+    j = _rpc_call("eth_getTransactionReceipt", [tx_hash])
+    if not j or "result" not in j or not isinstance(j["result"], dict):
+        return None
+    return j["result"]
+
+def _rpc_get_tx(tx_hash: str) -> dict | None:
+    j = _rpc_call("eth_getTransactionByHash", [tx_hash])
+    if not j or "result" not in j or not isinstance(j["result"], dict):
+        return None
+    return j["result"]
+
+def _hex_word_to_int(word_hex: str) -> int:
+    s = (word_hex or "").lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    s = s.strip()
+    if not s:
+        return 0
+    try:
+        return int(s, 16)
+    except Exception:
+        return 0
+
+def _extract_pool_id_from_input(input_hex: str) -> int | None:
+    """Extract staking poolId from transaction input data.
+
+    Supported:
+    - deposit(uint256 amount, uint256 poolId) selector 0xe2bbb158 (direct call)
+    - handleOps(...) relayed calls where deposit() calldata appears inside input
+    """
+    data = (input_hex or "").lower()
+    if not data or data == "0x":
+        return None
+    if not data.startswith("0x"):
+        data = "0x" + data
+    # Direct deposit: 4-byte selector + 2 words
+    if data.startswith(DEPOSIT_METHOD_ID):
+        payload = data[2 + 8:]  # strip 0x + selector
+        # needs 64 chars for amount + 64 for pool
+        if len(payload) < 128:
+            return None
+        pool_word = payload[64:128]
+        pool_id = _hex_word_to_int(pool_word)
+        return pool_id
+
+    # Relayed: try to find embedded deposit selector inside calldata
+    dep_sel = DEPOSIT_METHOD_ID[2:]  # without 0x
+    idx = data.find(dep_sel)
+    if idx != -1:
+        # idx is position in the full string (includes 0x), so start after selector
+        start = idx + len(dep_sel)
+        payload = data[start:]
+        # After selector: amount word + pool word
+        if len(payload) < 128:
+            return None
+        pool_word = payload[64:128]
+        pool_id = _hex_word_to_int(pool_word)
+        return pool_id
+
+    # Fallback: sometimes poolId shows up as a standalone word.
+    # Scan first ~20 words after selector and pick the first that matches known pools.
+    payload = data[2 + 8:] if len(data) >= 10 else data[2:]
+    for i in range(0, min(len(payload), 64 * 20), 64):
+        word = payload[i:i+64]
+        if len(word) != 64:
+            break
+        n = _hex_word_to_int(word)
+        if n in (3, 4, 5):
+            return n
+
+    return None
+
+def _lock_until_label_from_pool_id(pool_id: int | None) -> str | None:
+    if pool_id == 3:
+        return "January 1, 2027"
+    if pool_id == 4:
+        return "January 1, 2028"
+    if pool_id == 5:
+        return "January 1, 2030"
+    return None
+
+def _stake_lock_until_from_tx_hash(tx_hash: str) -> str | None:
+    tx = _rpc_get_tx(tx_hash)
+    if not tx:
+        return None
+    pool_id = _extract_pool_id_from_input(tx.get("input") or "")
+    return _lock_until_label_from_pool_id(pool_id)
 
     try:
-        clawd_bal_int = _erc20_balance_of(TOKEN_ADDRESS, CLAWD_WALLET)
-        weth_bal_int = _erc20_balance_of(WETH_ADDRESS, CLAWD_WALLET)
-        burned_bal_int = _erc20_balance_of(TOKEN_ADDRESS, BURN_ADDRESS)
-        incinerator_bal_int = _erc20_balance_of(TOKEN_ADDRESS, INCINERATOR_ADDRESS)
-        clawdviction_bal_int = _erc20_balance_of(TOKEN_ADDRESS, clawdviction_wallet)
-        clawdlabs_bal_int = _erc20_balance_of(TOKEN_ADDRESS, clawdlabs_wallet)
-    except Exception as e:
-        await update.message.reply_text(f"Failed to read balances from RPC: {e}")
-        return
+        return int(j["result"], 16)
+    except Exception:
+        return None
 
-    clawd_amt = _dec(clawd_bal_int, TOKEN_DECIMALS)
-    weth_amt = _dec(weth_bal_int, 18)
-    burned_amt = _dec(burned_bal_int, TOKEN_DECIMALS)
-    incinerator_amt = _dec(incinerator_bal_int, TOKEN_DECIMALS)
-    clawdviction_amt = _dec(clawdviction_bal_int, TOKEN_DECIMALS)
-    clawdlabs_amt = _dec(clawdlabs_bal_int, TOKEN_DECIMALS)
+def _topic_address(addr: str) -> str:
+    a = (addr or "").lower()
+    if not a.startswith("0x"):
+        a = "0x" + a
+    a = a[2:].rjust(64, "0")
+    return "0x" + a
 
-    clawd_usd = (float(price or 0.0)) * clawd_amt
-    weth_usd = (float(wp or 0.0)) * weth_amt
-    burned_usd = (float(price or 0.0)) * burned_amt
-    incinerator_usd = (float(price or 0.0)) * incinerator_amt
-    total_staked_amt = clawdviction_amt + clawdlabs_amt
-    total_staked_usd = (float(price or 0.0)) * total_staked_amt
+def _normalize_basescan_log(log: dict) -> dict:
+    """
+    Basescan/Etherscan getLogs can return decimal strings for blockNumber/logIndex.
+    Normalize them into hex strings like JSON-RPC.
+    """
+    out = dict(log)
 
-    total_value = clawd_usd + weth_usd
-
-    total_supply = 100_000_000_000.0
-    burned_pct = (burned_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
-    burned_bil = burned_amt / 1_000_000_000.0
-    incinerator_pct = (incinerator_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
-    incinerator_bil = incinerator_amt / 1_000_000_000.0
-    total_staked_pct = (total_staked_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
-    total_staked_bil = total_staked_amt / 1_000_000_000.0
-
-    wallet_link = f"https://basescan.org/address/{CLAWD_WALLET}"
-    wallet_html = f'<a href="{wallet_link}">{_short_addr_dots(CLAWD_WALLET)}</a>'
-
-    lines: List[str] = []
-    lines.append("<b>📊 CLAWD Stats</b>")
-    lines.append(f"Current price: {_fmt_price(price) if price is not None else 'N/A'}")
-    lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv is not None else 'N/A'}")
-    holders = _basescan_token_holder_count(TOKEN_ADDRESS)
-    lines.append(f"Holders: {holders:,}" if holders is not None else "Holders: N/A")
-    lines.append("")
-    lines.append("<b>🦞 My Wallet</b>")
-    lines.append(wallet_html)
-    lines.append(f"{_fmt_big(clawd_amt)} CLAWD ({_fmt_int_usd(clawd_usd)})")
-    lines.append(f"{_fmt_weth_two(weth_amt)} WETH ({_fmt_int_usd(weth_usd)})")
-    lines.append(f"Total value: {_fmt_int_usd(total_value)}")
-    lines.append("")
-    lines.append("<b>🔒 Staked</b>")
-    lines.append(
-        f'<a href="https://basescan.org/token/{TOKEN_ADDRESS}?a={clawdviction_wallet}">Clawdviction</a>: {_fmt_big(clawdviction_amt)} CLAWD'
-    )
-    lines.append(
-        f'<a href="https://basescan.org/token/{TOKEN_ADDRESS}?a={clawdlabs_wallet}">Clawdlabs</a>: {_fmt_big(clawdlabs_amt)} CLAWD'
-    )
-    lines.append(
-        f"{total_staked_bil:.2f}B CLAWD "
-        f"({_fmt_int_usd(total_staked_usd)} · {total_staked_pct:.2f}%)"
-    )
-    lines.append("")
-    lines.append("<b>🔥 Burned</b>")
-    lines.append(
-        f"{burned_bil:.2f}B CLAWD "
-        f"({_fmt_int_usd(burned_usd)} · {burned_pct:.2f}%)"
-    )
-    lines.append(
-        f"(+{incinerator_bil:.2f}B pending · {incinerator_pct:.2f}%)"
-    )
-    lines.append("")
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
-
-
-
-async def _run_burned_task(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int, status_msg_id: int, cancel_ev: asyncio.Event) -> None:
-    # Cooperative cancellation + non-blocking RPC calls (threaded)
-    chat_id = update.message.chat_id if update.message else None
-    try:
-        now_ts = int(time.time())
-
-        cache = _load_burned_cache()
-        cache_days = cache.get("days") or {}
-
-        cache_min = int(cache.get("min_scanned_block") or 0)
-        cache_max = int(cache.get("max_scanned_block") or 0)
-
-        latest = await asyncio.to_thread(_get_latest_block)
-        end_block = latest - max(0, WATCH_CONFIRMATIONS)
-        if end_block < 0:
-            end_block = 0
-
-        start_block = _approx_start_block(end_block, days)
-
-        # Determine which block ranges must be scanned to cover the requested window.
-        # We keep a min and max scanned block in cache to support both backfill and incremental updates.
-        ranges: List[Tuple[int, int]] = []
-
-        if cache_min <= 0 or cache_max <= 0:
-            ranges.append((start_block, end_block))
-            cache_min = start_block
-            cache_max = end_block
-        else:
-            if start_block < cache_min:
-                ranges.append((start_block, cache_min - 1))
-                cache_min = start_block
-            if end_block > cache_max:
-                ranges.append((cache_max + 1, end_block))
-                cache_max = end_block
-        to_topic = "0x" + _norm(BURN_ADDRESS).replace("0x", "").rjust(64, "0")
-
-        # Pull logs in small chunks to avoid RPC timeouts
-        all_logs: List[Dict[str, Any]] = []
-        chunk_size = max(500, int(RPC_LOG_CHUNK))
-        chunks_done = 0
-
-        for r_start, r_end in ranges:
-            if r_start > r_end:
-                continue
-
-            cur = r_start
-            while cur <= r_end:
-                if cancel_ev.is_set():
-                    raise asyncio.CancelledError()
-
-                end = min(r_end, cur + chunk_size - 1)
-                params = [{
-                    "fromBlock": hex(cur),
-                    "toBlock": hex(end),
-                    "address": TOKEN_ADDRESS,
-                    "topics": [TRANSFER_TOPIC0, None, to_topic],
-                }]
-                try:
-                    chunk = await asyncio.to_thread(_rpc, "eth_getLogs", params)
-                except Exception:
-                    # If RPC fails, try smaller chunk
-                    if chunk_size > 500:
-                        chunk_size = max(500, chunk_size // 2)
-                        continue
-                    chunk = []
-
-                if chunk:
-                    all_logs.extend(chunk)
-
-                cur = end + 1
-                chunks_done += 1
-
-                if chunks_done % 6 == 0 and chat_id is not None:
-                    try:
-                        await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=status_msg_id,
-                            text=f"Building burned chart for last {days}d... scanned up to block {end}/{end_block}",
-                        )
-                    except Exception:
-                        pass
-        # Aggregate burns by day (raw ints), using cache as the source of truth.
-        requested_days: List[str] = []
-        requested_set = set()
-        for i in range(days - 1, -1, -1):
-            d = _ymd_utc_from_ts(now_ts - i * 86400)
-            requested_days.append(d)
-            requested_set.add(d)
-
-        def _cache_day_int(day: str) -> int:
-            v = cache_days.get(day, {}).get("burned_raw")
-            try:
-                return int(v) if v is not None else 0
-            except Exception:
-                return 0
-
-        by_day: Dict[str, int] = {}
-        for d in requested_days:
-            by_day[d] = _cache_day_int(d)
-
-        # Map logs to UTC day with only 2 block timestamp RPC calls (fast).
-        min_bn = None
-        max_bn = None
-        for lg in all_logs:
-            bn_hex = lg.get("blockNumber")
-            if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
-                bn = int(bn_hex, 16)
-                if min_bn is None or bn < min_bn:
-                    min_bn = bn
-                if max_bn is None or bn > max_bn:
-                    max_bn = bn
-
-        ts_a = 0
-        spb = 2.0  # seconds per block fallback
-
-        if min_bn is not None and max_bn is not None:
-            try:
-                ts_a = int(await asyncio.to_thread(_get_block_timestamp, int(min_bn)) or 0)
-                ts_b = int(await asyncio.to_thread(_get_block_timestamp, int(max_bn)) or 0)
-                if ts_a > 0 and ts_b > 0 and max_bn > min_bn:
-                    spb = (ts_b - ts_a) / float(max_bn - min_bn)
-                    if spb <= 0:
-                        spb = 2.0
-            except Exception:
-                ts_a = 0
-
-        for lg in all_logs:
-            if cancel_ev.is_set():
-                raise asyncio.CancelledError()
-
-            bn_hex = lg.get("blockNumber")
-            if not isinstance(bn_hex, str) or not bn_hex.startswith("0x"):
-                continue
-            bn = int(bn_hex, 16)
-
-            if min_bn is not None and ts_a > 0:
-                ts = int(ts_a + (bn - min_bn) * spb)
-            else:
-                ts = now_ts
-
-            data_hex = lg.get("data") or "0x0"
-            try:
-                amt_int = int(data_hex, 16)
-            except Exception:
-                amt_int = 0
-            if amt_int <= 0:
-                continue
-
-            day = time.strftime("%Y-%m-%d", time.gmtime(ts))
-
-            prev = _cache_day_int(day)
-            new_total = prev + amt_int
-            cache_days[day] = {"burned_raw": str(new_total)}
-
-            if day in requested_set:
-                by_day[day] = new_total
-
-        # Persist cache progress
-        cache["min_scanned_block"] = int(cache_min)
-        cache["max_scanned_block"] = int(cache_max)
-        cache["days"] = cache_days
-        _save_burned_cache(cache)
-
-
-        days_list: List[str] = []
-        daily_tokens: List[float] = []
-
-        for i in range(days - 1, -1, -1):
-            day_ts = now_ts - i * 86400
-            day = time.strftime("%Y-%m-%d", time.gmtime(day_ts))
-            days_list.append(day)
-            daily_tokens.append(_dec(by_day.get(day, 0), TOKEN_DECIMALS))
-
-        cumulative: List[float] = []
-        running = 0.0
-        for v in daily_tokens:
-            running += float(v)
-            cumulative.append(running)
-
-        x = list(range(len(days_list)))
-        fig, ax = plt.subplots(figsize=(10, 5))
-
-        bars = ax.bar(x, daily_tokens, width=0.55, color="#d62728")
-        ax.set_title(f"CLAWD Burned per day (last {days}d)")
-        ax.set_xlabel("Day (UTC)")
-        ax.set_ylabel("Burned per day (CLAWD)")
-        ax.set_xticks(x)
-        ax.set_xticklabels([d[5:] for d in days_list], rotation=45, ha="right")
-
-        max_daily = max([float(v) for v in daily_tokens], default=0.0)
-        if max_daily > 0:
-            ax.set_ylim(0, max_daily * 1.25)
-
-        ax.yaxis.set_major_formatter(FuncFormatter(_fmt_axis_millions))
-
-        for b in bars:
-            h = float(b.get_height())
-            if h <= 0:
-                continue
-            ax.annotate(
-                _fmt_compact_int(h),
-                (b.get_x() + b.get_width() / 2.0, h),
-                xytext=(0, 6),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", lw=1),
-            )
-
-        ax2 = ax.twinx()
-        ax2.plot(x, cumulative, color="#111111", linewidth=2)
-        ax2.set_ylabel("Cumulative (CLAWD)")
-        ax2.yaxis.set_major_formatter(FuncFormatter(_fmt_axis_millions))
-
-        if cumulative:
-            last_x = x[-1]
-            last_y = float(cumulative[-1])
-            ax2.annotate(
-                _fmt_compact_int(last_y),
-                (last_x, last_y),
-                xytext=(10, 0),
-                textcoords="offset points",
-                ha="left",
-                va="center",
-                fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#111111", lw=1),
-            )
-        fig.tight_layout()
-
+    def _to_hex_str(v):
+        if v is None:
+            return "0x0"
+        if isinstance(v, int):
+            return hex(v)
+        s = str(v).strip()
+        if s.startswith("0x"):
+            return s.lower()
+        # decimal string
         try:
-            os.makedirs(DATA_PATH, exist_ok=True)
+            return hex(int(s))
         except Exception:
-            pass
+            return "0x0"
 
-        out_path = os.path.join(DATA_PATH, f"burned_{days}d.png")
-        fig.savefig(out_path, dpi=150)
-        plt.close(fig)
-
-        total_burned_period = cumulative[-1] if cumulative else 0.0
-        burned_pct_supply = (float(total_burned_period) / float(TOTAL_SUPPLY) * 100.0) if float(TOTAL_SUPPLY) > 0 else 0.0
-        msg = f"<b>🔥 Burned last {days}d</b>\nTotal: {_fmt_num(total_burned_period)} CLAWD ({burned_pct_supply:.2f}% of supply)"
-        with open(out_path, "rb") as f:
-            await update.message.reply_photo(photo=f, caption=msg, parse_mode="HTML")
-
-        # Clean up status message
-        if chat_id is not None:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
-            except Exception:
-                pass
-
-    except asyncio.CancelledError:
-        if update.message:
-            try:
-                await update.message.reply_text("Cancelled.")
-            except Exception:
-                pass
-        raise
-    except Exception as e:
-        if update.message:
-            await update.message.reply_text(f"Failed to build burned chart: {e}")
+    out["blockNumber"] = _to_hex_str(out.get("blockNumber"))
+    out["logIndex"] = _to_hex_str(out.get("logIndex"))
+    out["transactionIndex"] = _to_hex_str(out.get("transactionIndex"))
+    return out
 
 
-async def cmd_burned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
+def _basescan_get_logs(from_block: int, to_block: int) -> list[dict]:
+    """
+    Fallback to BaseScan getLogs API when RPC eth_getLogs fails.
 
-    days = 7
-    if context.args:
-        arg = (context.args[0] or "").strip().lower()
-        m = re.match(r"^(\d+)(d)?$", arg)
-        if m:
-            try:
-                days = int(m.group(1))
-            except Exception:
-                days = 7
-
-    days = max(1, min(60, days))
-
-    status = await update.message.reply_text(f"Building burned chart for last {days}d...")
-
-    # Cancel any existing task first
-    for name, ev in list(TASK_CANCEL_EVENTS.items()):
-        try:
-            ev.set()
-        except Exception:
-            pass
-    for name, task in list(TASK_REGISTRY.items()):
-        if not task.done():
-            task.cancel()
-
-    name = f"burned:{update.message.chat_id}"
-    cancel_ev = asyncio.Event()
-    TASK_CANCEL_EVENTS[name] = cancel_ev
-
-    task = asyncio.create_task(_run_burned_task(update, context, days, status.message_id, cancel_ev))
-    _track_task(name, task)
-
-
-# =========================
-# Watcher
-# =========================
-
-def _eid(kind: str, tx_hash: str, log_index_hex: str) -> str:
-    return f"{kind}:{tx_hash}:{log_index_hex}"
-
-
-def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
-    state = _load_state()
-    latest = _get_latest_block()
-    confirmed_latest = latest - max(0, WATCH_CONFIRMATIONS)
-    if confirmed_latest < 0:
-        confirmed_latest = 0
-
-    last_scanned = int(state["watch"].get("last_scanned_block") or 0)
-    if last_scanned <= 0:
-        start = max(0, confirmed_latest - 5)
-    else:
-        start = max(0, last_scanned - WATCH_OVERLAP_BLOCKS)
-
-    end = confirmed_latest
-    if end < start:
+    Important: Some explorers can be picky about topic operators.
+    We query ALL Transfer logs (topic0) for the token in the block range,
+    then filter topic2 locally.
+    Requires BASESCAN_API_KEY or ETHERSCAN_APIKEY in env.
+    """
+    if not SCAN_APIKEY:
         return []
 
-    logs = _get_logs_chunked(TOKEN_ADDRESS, start, end)
+    params = {
+        "module": "logs",
+        "action": "getLogs",
+        "fromBlock": str(from_block),
+        "toBlock": str(to_block),
+        "address": TUSD_CONTRACT_ADDRESS,
+        "topic0": TRANSFER_TOPIC0,
+        "apikey": SCAN_APIKEY,
+    }
 
-    seen_buy = set(state["watch"]["seen"].get("buy") or [])
-    seen_stake = set(state["watch"]["seen"].get("stake") or [])
-    seen_burn = set(state["watch"]["seen"].get("burn") or [])
-
-    # cache token price for buy sanity check and burn/stake USD
-    price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
-    if price is not None:
-        state["cache"]["token_price_usd"] = float(price)
-    else:
-        price = state.get("cache", {}).get("token_price_usd")
-    _save_state(state)
-
-    token_price = float(price) if price is not None else 0.0
-
-    BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT","0.10"))
-
-
-    state_min = state["min_usd"]
-
-    outgoing: List[Tuple[str, str, str, str]] = []  # (kind, uid, caption, wallet_addr_for_link)
-
-    txs_for_buy: List[str] = []
-    tx_value_est = {}  # estimated token value per tx
-    tx_seen_local = set()
-
-    for lg in logs:
-        tx_hash = lg.get("transactionHash")
-        log_index = lg.get("logIndex", "0x0")
-
-        classified = _classify_transfer_log(lg)
-        if classified and tx_hash:
-            kind, from_addr, _to, amount_int = classified
-            event_id = _eid(kind, tx_hash, log_index)
-
-            if kind == "stake":
-                if event_id not in seen_stake:
-                    amount = _dec(amount_int, TOKEN_DECIMALS)
-
-                    # If we cannot price the token right now, do not mark as seen.
-                    # This avoids permanently losing stake alerts due to temporary price feed hiccups.
-                    if token_price <= 0.0:
-                        continue
-
-                    usd = amount * token_price
-                    if usd >= float(state_min["stake"]):
-                        block_number = int(lg.get("blockNumber", "0x0"), 16) if lg.get("blockNumber") else None
-                        if not _event_is_too_old(block_number):
-                            caption = _event_caption("stake", tx_hash, amount, usd, from_addr)
-                            outgoing.append(("stake", event_id, caption, from_addr))
-
-                    # Mark as seen only when we had a valid price.
-                    # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
-                    seen_stake.add(event_id)
-
-            elif kind == "burn":
-                if event_id not in seen_burn:
-                    amount = _dec(amount_int, TOKEN_DECIMALS)
-
-                    # If we cannot price the token right now, do not mark as seen.
-                    # This avoids permanently losing burn alerts due to temporary price feed hiccups.
-                    if token_price <= 0.0:
-                        continue
-
-                    usd = amount * token_price
-                    if usd >= float(state_min["burn"]):
-                        block_number = int(lg.get("blockNumber", "0x0"), 16) if lg.get("blockNumber") else None
-                        if not _event_is_too_old(block_number):
-                            caption = _event_caption("burn", tx_hash, amount, usd, from_addr)
-                            outgoing.append(("burn", event_id, caption, from_addr))
-
-                    # Mark as seen only when we had a valid price.
-                    # If it did not pass the USD threshold, we still mark it to avoid re-alerting later on normal price moves.
-                    seen_burn.add(event_id)
-
-        if tx_hash:
-            try:
-                est = abs(_dec(amount_int, TOKEN_DECIMALS)) if 'amount_int' in locals() else 0
-                tx_value_est[tx_hash] = tx_value_est.get(tx_hash,0)+est
-            except Exception:
-                pass
-        if tx_hash and tx_hash not in tx_seen_local:
-            tx_seen_local.add(tx_hash)
-            txs_for_buy.append(tx_hash)
-
-    for h in txs_for_buy:
-        if token_price>0:
-            est_usd = tx_value_est.get(h,0)*token_price
-            if est_usd < float(state_min["buy"]) * BUY_RECEIPT_PREFILTER_PCT:
-                continue
-
-        buy_id = f"buy:{h}"
-        if buy_id in seen_buy:
-            continue
-
-        # Only mark as seen after successful processing (avoid losing events on RPC hiccups)
+    try:
+        r = requests.get(BASESCAN_API_URL, params=params, timeout=25)
+        r.raise_for_status()
+        j = r.json()
+        if not isinstance(j, dict):
+            return []
+        res = j.get("result")
+        if not isinstance(res, list):
+            return []
+        return [_normalize_basescan_log(x) for x in res if isinstance(x, dict)]
+    except Exception as e:
         try:
-            receipt = _get_receipt(h)
-
-            # For realtime monitoring, allow a live ETH/USD fallback if historical pricing is unavailable.
-            buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
-            if buy:
-                usd = float(buy["usd"])
-                if usd >= float(state_min["buy"]):
-                    block_number = int(receipt.get("blockNumber", "0x0"), 16) if receipt.get("blockNumber") else None
-                    if not _event_is_too_old(block_number):
-                        tokens = float(buy["tokens"])
-                        buyer = buy["buyer"]
-                        caption = _event_caption("buy", h, tokens, usd, buyer, pay=buy.get("pay"))
-                        outgoing.append(("buy", buy_id, caption, buyer))
-
-                # Mark as seen only if we successfully detected a BUY.
-                seen_buy.add(buy_id)
-                continue
-
-            # Not detected as a buy. If it is a SELL, mark as seen so we don't keep re-processing it.
-            try:
-                sell = _sell_from_receipt(h, receipt)
-            except Exception:
-                sell = None
-
-            if sell:
-                seen_buy.add(buy_id)
-                continue
-
-            # If neither buy nor sell, do NOT mark as seen.
-            # This allows a retry within the overlap window (protects against transient RPC/price issues).
-        except Exception:
-            continue
-
-    state["watch"]["last_scanned_block"] = end
-    state["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
-    state["watch"]["seen"]["stake"] = _prune_seen(list(seen_stake))
-    state["watch"]["seen"]["burn"] = _prune_seen(list(seen_burn))
-    _save_state(state)
-
-    return outgoing
-
-
-async def monitor(app) -> None:
-    while True:
-        try:
-            outgoing = await asyncio.to_thread(_monitor_tick_sync)
-
-            # Dedup at send-time to prevent double alerts (restart, overlap, RPC hiccups)
-            state = _load_state()
-            state.setdefault("watch", {}).setdefault("sent_public", {"buy": [], "stake": [], "burn": []})
-
-            sent_buy = set(state["watch"]["sent_public"].get("buy") or [])
-            sent_stake = set(state["watch"]["sent_public"].get("stake") or [])
-            sent_burn = set(state["watch"]["sent_public"].get("burn") or [])
-
-            for kind, uid, caption, _wallet in outgoing:
-                if kind == "buy" and uid in sent_buy:
-                    continue
-                if kind == "stake" and uid in sent_stake:
-                    continue
-                if kind == "burn" and uid in sent_burn:
-                    continue
-
-                # Public (group) alert: BUY, STAKE and BURN
-                if ALLOWED_CHAT_ID and kind in ("buy", "stake", "burn"):
-                    await _send_photo_or_text(app, ALLOWED_CHAT_ID, kind, caption)
-
-                # Mark as sent ONLY after successful send
-                if kind == "buy":
-                    sent_buy.add(uid)
-                    state["watch"]["sent_public"]["buy"] = _prune_seen(list(sent_buy))
-                elif kind == "stake":
-                    sent_stake.add(uid)
-                    state["watch"]["sent_public"]["stake"] = _prune_seen(list(sent_stake))
-                elif kind == "burn":
-                    sent_burn.add(uid)
-                    state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
-
-                _save_state(state)
-
-                # Optional: DM alert to admin (toggle with /alerts on|off)
-                try:
-                    dm_enabled = bool(state.get("alerts_dm", True)) and bool(ADMIN_ID)
-                except Exception:
-                    dm_enabled = False
-
-                if dm_enabled:
-                    state.setdefault("watch", {}).setdefault("sent_dm", {"buy": [], "stake": [], "burn": []})
-                    sent_dm_buy = set(state["watch"]["sent_dm"].get("buy") or [])
-                    sent_dm_stake = set(state["watch"]["sent_dm"].get("stake") or [])
-                    sent_dm_burn = set(state["watch"]["sent_dm"].get("burn") or [])
-
-                    already = False
-                    if kind == "buy":
-                        already = (uid in sent_dm_buy)
-                        if not already:
-                            sent_dm_buy.add(uid)
-                            state["watch"]["sent_dm"]["buy"] = _prune_seen(list(sent_dm_buy))
-                    elif kind == "stake":
-                        already = (uid in sent_dm_stake)
-                        if not already:
-                            sent_dm_stake.add(uid)
-                            state["watch"]["sent_dm"]["stake"] = _prune_seen(list(sent_dm_stake))
-                    elif kind == "burn":
-                        already = (uid in sent_dm_burn)
-                        if not already:
-                            sent_dm_burn.add(uid)
-                            state["watch"]["sent_dm"]["burn"] = _prune_seen(list(sent_dm_burn))
-
-                    if not already:
-                        _save_state(state)
-                        await _send_photo_or_text(app, ADMIN_ID, kind, caption)
+            print(f"[basescan] getLogs failed err={e}")
         except Exception:
             pass
+        return []
+
+
+def _rpc_get_logs(from_block: int, to_block: int, topic2_to: str) -> list[dict]:
+    """
+    JSON-RPC eth_getLogs with limited retries.
+
+    Important: an empty result list is a valid response and should NOT trigger retries or fallback.
+    Fallback to BaseScan getLogs is used ONLY if the RPC call fails repeatedly.
+    """
+    params = [{
+        "fromBlock": hex(from_block),
+        "toBlock": hex(to_block),
+        "address": TUSD_CONTRACT_ADDRESS,
+        "topics": [TRANSFER_TOPIC0, None, topic2_to],
+    }]
+
+    last_ok = None
+    # Retry only on RPC failure/invalid payload, not on empty results
+    for attempt in range(2):
+        j = _rpc_call("eth_getLogs", params)
+        if j and "result" in j and isinstance(j["result"], list):
+            last_ok = j["result"]
+            return last_ok  # may be empty, that's fine
+        time.sleep(0.25 * (attempt + 1))
+
+    # Fallback: BaseScan getLogs ONLY if RPC failed
+    logs = _basescan_get_logs(from_block, to_block)
+    out: list[dict] = []
+    t2 = (topic2_to or "").lower()
+    for lg in logs:
+        topics = lg.get("topics") or []
+        if not isinstance(topics, list) or len(topics) < 3:
+            continue
+        if str(topics[2]).lower() == t2:
+            out.append(lg)
+    return out
+
+def _dexscreener_mcap_usd(token_address: str) -> int | None:
+    try:
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        pairs = j.get("pairs") or []
+        if not pairs:
+            return None
+
+        base_pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "base"]
+        best = base_pairs[0] if base_pairs else pairs[0]
+
+        mc = best.get("marketCap")
+        if mc is None:
+            mc = best.get("fdv")
+        if mc is None:
+            return None
+        return int(float(mc))
+    except Exception:
+        return None
+
+def _fmt_int(n: int) -> str:
+    return f"{n:,}"
+
+def _fmt_tusd(amount_float: float) -> str:
+    try:
+        n = int(round(float(amount_float)))
+    except Exception:
+        n = 0
+    return f"{n:,}"
+
+
+def _event_token_price_usd() -> float:
+    try:
+        price, _fdv = _dex_price_fdv(TUSD_CONTRACT_ADDRESS)
+        return float(price or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _fmt_tusd_with_usd(amount_float: float) -> str:
+    usd = int(round(float(amount_float) * _event_token_price_usd()))
+    return f"{_fmt_tusd(amount_float)} (${usd:,})"
+
+
+def _emoji_block_flat(emoji: str, amount_float: float, amount_per_emoji: int | float | None = None) -> str:
+    per_emoji = float(amount_per_emoji or EMOJI_PER_TUSD or 1)
+    count = int(amount_float // per_emoji)
+
+    if amount_float > 0 and count == 0:
+        count = 1
+
+    count = min(count, MAX_EVENT_EMOJIS)
+
+    return emoji * count
+
+
+def _emoji_block(emoji: str, amount_float: float, amount_per_emoji: int | float | None = None) -> str:
+    return _emoji_block_flat(emoji, amount_float, amount_per_emoji)
+
+
+def _short_addr(a: str) -> str:
+    if not a or len(a) < 10:
+        return a
+    return f"{a[:6]}...{a[-4:]}"
+
+
+
+def _norm_addr(a: str) -> str:
+    s = (a or "").strip().lower()
+    if not s:
+        return ""
+    if not s.startswith("0x"):
+        s = "0x" + s
+    return s
+
+def _aggregate_net_deltas_from_receipt(receipt: dict, token_addresses: dict[str, int]) -> dict[str, dict[str, int]]:
+    """Return dict[token_addr][holder_addr] = net_delta_int."""
+    deltas: dict[str, dict[str, int]] = {}
+    for t in token_addresses.keys():
+        deltas[_norm_addr(t)] = {}
+
+    logs = receipt.get("logs") or []
+    if not isinstance(logs, list):
+        return deltas
+
+    for lg in logs:
+        if not isinstance(lg, dict):
+            continue
+        addr = _norm_addr(lg.get("address") or "")
+        if addr not in deltas:
+            continue
+        topics = lg.get("topics") or []
+        if not isinstance(topics, list) or len(topics) < 3:
+            continue
+        if str(topics[0]).lower() != TRANSFER_TOPIC0:
+            continue
+        from_addr = _topic_to_addr(str(topics[1]))
+        to_addr = _topic_to_addr(str(topics[2]))
+        try:
+            value_int = int(lg.get("data", "0x0"), 16)
+        except Exception:
+            continue
+
+        deltas[addr][from_addr] = int(deltas[addr].get(from_addr, 0)) - value_int
+        deltas[addr][to_addr] = int(deltas[addr].get(to_addr, 0)) + value_int
+
+    return deltas
+
+def _pick_biggest_positive_holder(token_deltas: dict[str, int], exclude: set[str]) -> tuple[str | None, int]:
+    best_addr = None
+    best_delta = 0
+    for addr, delta in (token_deltas or {}).items():
+        a = _norm_addr(addr)
+        if not a or a in exclude:
+            continue
+        if int(delta) > best_delta:
+            best_delta = int(delta)
+            best_addr = a
+    return best_addr, best_delta
+
+def _classify_transfer_log_kind(log: dict) -> tuple[str, str, float] | None:
+    """Classify a single ERC20 Transfer log as stake/burn and return (kind, from_addr, amount_float)."""
+    if _norm_addr(log.get("address") or "") != _norm_addr(TUSD_CONTRACT_ADDRESS):
+        return None
+    topics = log.get("topics") or []
+    if not isinstance(topics, list) or len(topics) < 3:
+        return None
+    if str(topics[0]).lower() != TRANSFER_TOPIC0:
+        return None
+    from_addr = _topic_to_addr(str(topics[1]))
+    to_addr = _topic_to_addr(str(topics[2]))
+    try:
+        value_wei = int(log.get("data", "0x0"), 16)
+    except Exception:
+        return None
+    amount = value_wei / (10 ** TUSD_DECIMALS)
+
+    if _norm_addr(to_addr) == _norm_addr(STAKING_CONTRACT_ADDRESS):
+        return ("stake", from_addr, float(amount))
+    if _norm_addr(to_addr) == _norm_addr(BURN_ADDRESS):
+        return ("burn", from_addr, float(amount))
+    return None
+
+def _build_stake_caption(tx_hash: str, amount_float: float, from_addr: str) -> str:
+    emoji_lines = _emoji_block_flat("🔒", amount_float).strip()
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    from_url = f"https://basescan.org/address/{from_addr}"
+
+    lock_until = _stake_lock_until_from_tx_hash(tx_hash)
+    lock_line = f"\nLocked until: {lock_until}" if lock_until else "\nLocked until: Unknown"
+
+    caption = (
+        "<b>₸USD STAKED!</b>\n\n"
+        f"{emoji_lines}\n\n"
+        f"₸USD: {_fmt_tusd(amount_float)} (<a href=\"{tx_url}\">Tx</a>)\n"
+        f"Wallet: <a href=\"{from_url}\">{_short_addr(from_addr)}</a>"
+        f"{lock_line}"
+    )
+    return caption
+
+def _build_burn_caption(tx_hash: str, amount_float: float, from_addr: str) -> str:
+    emoji_lines = _emoji_block_flat("🔥", amount_float).strip()
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    from_url = f"https://basescan.org/address/{from_addr}"
+    caption = (
+        "<b>₸USD BURNED!</b>\n\n"
+        f"{emoji_lines}\n\n"
+        f"₸USD: {_fmt_tusd(amount_float)} (<a href=\"{tx_url}\">Tx</a>)\n"
+        f"Wallet: <a href=\"{from_url}\">{_short_addr(from_addr)}</a>"
+    )
+    return caption
+
+def _build_buy_caption(tx_hash: str, amount_float: float, buyer_addr: str) -> str:
+    emoji_lines = _emoji_block_flat("🟢", amount_float).strip()
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    buyer_url = f"https://basescan.org/address/{buyer_addr}"
+    caption = (
+        "<b>₸USD BOUGHT!</b>\n\n"
+        f"{emoji_lines}\n\n"
+        f"₸USD: {_fmt_tusd(amount_float)} (<a href=\"{tx_url}\">Tx</a>)\n"
+        f"Wallet: <a href=\"{buyer_url}\">{_short_addr(buyer_addr)}</a>"
+    )
+    return caption
+
+def _buy_from_receipt_simple(tx_hash: str, receipt: dict) -> dict | None:
+    """Heuristic buy detector for /scan <tx_hash>.
+
+    It looks for the biggest positive ₸USD delta to a non-excluded address.
+    """
+    token_addresses = {
+        TUSD_CONTRACT_ADDRESS: TUSD_DECIMALS,
+        USDC_ADDRESS: 6,
+        USDT_ADDRESS: 6,
+        WETH_ADDRESS: 18,
+    }
+    deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
+    tusd_deltas = deltas.get(_norm_addr(TUSD_CONTRACT_ADDRESS)) or {}
+    if not tusd_deltas:
+        return None
+
+    exclude = {
+        _norm_addr(TUSD_CONTRACT_ADDRESS),
+        _norm_addr(STAKING_CONTRACT_ADDRESS),
+        _norm_addr(BURN_ADDRESS),
+        _norm_addr(WETH_ADDRESS),
+        _norm_addr(USDC_ADDRESS),
+        _norm_addr(USDT_ADDRESS),
+    }
+
+    buyer, buyer_delta_int = _pick_biggest_positive_holder(tusd_deltas, exclude)
+    if not buyer or buyer_delta_int <= 0:
+        return None
+
+    amount = buyer_delta_int / (10 ** TUSD_DECIMALS)
+
+    # If this was actually a stake, ignore it here (stake/burn handled separately)
+    # Stake transfers would have to == staking contract, not buyer.
+    return {"buyer": buyer, "amount": float(amount)}
+
+
+def _is_buyback_tx(tx_hash: str, receipt: dict | None = None, tx: dict | None = None) -> bool:
+    tx = tx or _rpc_get_tx(tx_hash)
+    if not tx:
+        return False
+    tx_to = _norm_addr(tx.get("to") or "")
+    tx_input = (tx.get("input") or "").lower()
+    if tx_to != _norm_addr(BUYBACK_CONTRACT_ADDRESS):
+        return False
+    if not tx_input.startswith(BUYBACK_METHOD_ID):
+        return False
+    if receipt is not None:
+        status = str(receipt.get("status") or "").lower()
+        if status not in ("0x1", "1"):
+            return False
+    return True
+
+
+def _buyback_from_receipt(tx_hash: str, receipt: dict) -> dict | None:
+    tx = _rpc_get_tx(tx_hash)
+    if not _is_buyback_tx(tx_hash, receipt=receipt, tx=tx):
+        return None
+
+    total_int = 0
+    for lg in (receipt.get("logs") or []):
+        if not isinstance(lg, dict):
+            continue
+        if _norm_addr(lg.get("address") or "") != _norm_addr(TUSD_CONTRACT_ADDRESS):
+            continue
+        topics = lg.get("topics") or []
+        if not isinstance(topics, list) or len(topics) < 3:
+            continue
+        if str(topics[0]).lower() != TRANSFER_TOPIC0:
+            continue
+        to_addr = _topic_to_addr(str(topics[2]))
+        if _norm_addr(to_addr) != _norm_addr(BUYBACK_CONTRACT_ADDRESS):
+            continue
+        try:
+            total_int += int(lg.get("data", "0x0"), 16)
+        except Exception:
+            continue
+
+    if total_int <= 0:
+        return None
+
+    return {"wallet": _norm_addr(BUYBACK_CONTRACT_ADDRESS), "amount": total_int / (10 ** TUSD_DECIMALS)}
+
+
+async def _send_event_media(app, chat_id: int, caption: str, *, photo_bytes: bytes | None = None, media_path: str | None = None):
+    if photo_bytes:
+        await app.bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption, parse_mode="HTML")
+        return
+
+    media_path = (media_path or "").strip()
+    if media_path and os.path.exists(media_path):
+        lower = media_path.lower()
+        with open(media_path, "rb") as f:
+            if lower.endswith((".mp4", ".gif.mp4", ".gif", ".webm")):
+                await app.bot.send_animation(chat_id=chat_id, animation=f, caption=caption, parse_mode="HTML")
+            else:
+                await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+        return
+
+    await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def _post_stake_event(app, tx_hash: str, amount_float: float, from_addr: str):
+    if not ALLOWED_CHAT_ID:
+        return
+
+    caption = _build_stake_caption(tx_hash, amount_float, from_addr)
+    photo = MEME_BYTES.get("event_staked") or MEME_BYTES.get("debt_update")
+
+    lock_until = _stake_lock_until_from_tx_hash(tx_hash)
+    if lock_until == "January 1, 2030":
+        photo = MEME_BYTES.get("event_staked_pool5", photo)
+
+    await _send_event_media(app, ALLOWED_CHAT_ID, caption, photo_bytes=photo)
+
+
+async def _post_burn_event(app, tx_hash: str, amount_float: float, from_addr: str):
+    if not ALLOWED_CHAT_ID:
+        return
+
+    caption = _build_burn_caption(tx_hash, amount_float, from_addr)
+    photo = MEME_BYTES.get("event_burned") or MEME_BYTES.get("debt_update")
+    await _send_event_media(app, ALLOWED_CHAT_ID, caption, photo_bytes=photo)
+
+
+async def _post_buyback_event(app, tx_hash: str, amount_float: float):
+    if not ALLOWED_CHAT_ID:
+        return
+
+    caption = _build_buyback_caption(tx_hash, amount_float)
+    await _send_event_media(app, ALLOWED_CHAT_ID, caption, media_path=BUYBACK_MEDIA_PATH)
+
+def _topic_to_addr(topic_hex: str) -> str:
+    t = topic_hex.lower()
+    if t.startswith("0x"):
+        t = t[2:]
+    return "0x" + t[-40:]
+
+
+async def _process_transfer_logs(app, logs: list[dict], last_block: int, last_log_index: int, kind: str) -> tuple[int, int]:
+    max_block = last_block
+    max_index = last_log_index
+
+    def _key(l):
+        try:
+            b = int(l.get("blockNumber", "0x0"), 16)
+        except Exception:
+            b = 0
+        try:
+            i = int(l.get("logIndex", "0x0"), 16)
+        except Exception:
+            i = 0
+        return (b, i)
+
+    for log in sorted(logs, key=_key):
+        try:
+            b = int(log.get("blockNumber", "0x0"), 16)
+            i = int(log.get("logIndex", "0x0"), 16)
+        except Exception:
+            continue
+
+        if b < last_block or (b == last_block and i <= last_log_index):
+            continue
+
+        tx_hash = log.get("transactionHash") or ""
+        if not tx_hash:
+            continue
+
+        # 🔹 EXTRAER FROM ADDRESS
+        topics = log.get("topics", [])
+        if len(topics) < 3:
+            continue
+
+        from_addr = _topic_to_addr(topics[1])
+
+        # 🔹 EXTRAER MONTO
+        try:
+            value_wei = int(log.get("data", "0x0"), 16)
+        except Exception:
+            continue
+
+        amount = value_wei / (10 ** TUSD_DECIMALS)
+
+        # 🔹 POST EVENTO
+        if kind == "stake":
+            await _post_stake_event(app, tx_hash, amount, from_addr)
+        else:
+            await _post_burn_event(app, tx_hash, amount, from_addr)
+
+        if b > max_block or (b == max_block and i > max_index):
+            max_block = b
+            max_index = i
+
+    return max_block, max_index
+
+
+def _append_seen_id(state: dict, eid: str, max_seen: int) -> None:
+    """
+    Keep seen_event_ids as an ORDERED rolling list (stable trimming).
+    Also maintain a set in memory (created in monitor) for fast lookup.
+    """
+    seen = state.get("seen_event_ids")
+    if not isinstance(seen, list):
+        seen = []
+    seen.append(eid)
+    if len(seen) > max_seen:
+        seen[:] = seen[-max_seen:]
+    state["seen_event_ids"] = seen
+
+
+async def _process_transfer_logs_dedup_cursor(
+    *,
+    app,
+    kind: str,
+    logs: list[dict],
+    last_block: int,
+    last_log_index: int,
+    seen_set: set,
+    state: dict,
+    max_seen: int,
+) -> tuple[int, int]:
+    """
+    Process logs ordered by (blockNumber, logIndex).
+    Dedup by (kind, tx_hash, logIndex).
+    Advance cursor EXACTLY to the max processed (block, logIndex).
+    """
+
+    def _sort_key(log: dict) -> tuple[int, int]:
+        try:
+            b = int(log.get("blockNumber", "0x0"), 16)
+        except Exception:
+            b = 0
+        try:
+            i = int(log.get("logIndex", "0x0"), 16)
+        except Exception:
+            i = 0
+        return (b, i)
+
+    max_block = last_block
+    max_index = last_log_index
+
+    posted = 0
+
+    for log in sorted(logs, key=_sort_key):
+        try:
+            b = int(log.get("blockNumber", "0x0"), 16)
+            i = int(log.get("logIndex", "0x0"), 16)
+        except Exception:
+            continue
+
+        # Skip already-processed cursor region
+        if b < last_block or (b == last_block and i <= last_log_index):
+            continue
+
+        tx_hash = (log.get("transactionHash") or "").strip()
+        if not tx_hash:
+            continue
+
+        log_index_hex = (log.get("logIndex") or "").lower()
+        eid = f"{kind}:{tx_hash.lower()}:{log_index_hex}"
+
+        # Dedup
+        if eid in seen_set:
+            # Even if dup, still advance cursor safely
+            if b > max_block or (b == max_block and i > max_index):
+                max_block = b
+                max_index = i
+            continue
+
+        topics = log.get("topics") or []
+        if not isinstance(topics, list) or len(topics) < 3:
+            continue
+
+        from_addr = _topic_to_addr(topics[1])
+
+        try:
+            value_wei = int(log.get("data", "0x0"), 16)
+        except Exception:
+            continue
+
+        amount = value_wei / (10 ** TUSD_DECIMALS)
+
+        if kind == "stake":
+            await _post_stake_event(app, tx_hash, amount, from_addr)
+        else:
+            await _post_burn_event(app, tx_hash, amount, from_addr)
+
+        posted += 1
+
+        seen_set.add(eid)
+        _append_seen_id(state, eid, max_seen)
+
+        if b > max_block or (b == max_block and i > max_index):
+            max_block = b
+            max_index = i
+
+    return max_block, max_index, posted
+async def monitor_stake_and_burn(app):
+    if not ALLOWED_CHAT_ID:
+        return
+    if not TUSD_CONTRACT_ADDRESS:
+        return
+
+    # How many blocks to wait before considering logs "stable"
+    confirmations = int(os.environ.get("WATCH_CONFIRMATIONS", "2"))
+
+    # Always rescan a small overlap window to never miss events due to ordering,
+    # node inconsistency, or same block log ordering edge cases.
+    overlap_blocks = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "5"))
+
+    # Keep a rolling cache of processed event IDs to prevent duplicates
+    max_seen = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
+
+    stake_to_topic = _topic_address(STAKING_CONTRACT_ADDRESS)
+    burn_to_topic = _topic_address(BURN_ADDRESS)
+    buyback_to_topic = _topic_address(BUYBACK_CONTRACT_ADDRESS)
+
+    state = _read_watch_state()
+
+    # Cursor blocks (we will rescan overlap anyway)
+    stake_last_block = int(state.get("stake_last_block", 0) or 0)
+    burn_last_block = int(state.get("burn_last_block", 0) or 0)
+    buyback_last_block = int(state.get("buyback_last_block", 0) or 0)
+
+    # Rolling dedupe cache
+    seen = state.get("seen_event_ids") or []
+    if not isinstance(seen, list):
+        seen = []
+    seen_set = set(x for x in seen if isinstance(x, str))
+
+    # Initialize cursors to "safe latest" to avoid historical spam on first boot
+    if stake_last_block == 0 or burn_last_block == 0 or buyback_last_block == 0:
+        latest = _rpc_latest_block()
+        if latest is None:
+            return
+        safe_latest = max(latest - confirmations, 0)
+        if stake_last_block == 0:
+            stake_last_block = safe_latest
+        if burn_last_block == 0:
+            burn_last_block = safe_latest
+        if buyback_last_block == 0:
+            buyback_last_block = safe_latest
+
+        state["stake_last_block"] = stake_last_block
+        state["burn_last_block"] = burn_last_block
+        state["buyback_last_block"] = buyback_last_block
+        state["seen_event_ids"] = list(seen_set)[-max_seen:]
+        _write_watch_state(state)
+
+    def _event_id(kind: str, tx_hash: str, log_index_hex: str) -> str:
+        return f"{kind}:{tx_hash.lower()}:{(log_index_hex or '').lower()}"
+
+    def _sort_key(log: dict) -> tuple[int, int]:
+        try:
+            b = int(log.get("blockNumber", "0x0"), 16)
+        except Exception:
+            b = 0
+        try:
+            i = int(log.get("logIndex", "0x0"), 16)
+        except Exception:
+            i = 0
+        return (b, i)
+
+    async def _handle_logs(kind: str, logs: list[dict]):
+        nonlocal seen_set
+
+        for log in sorted(logs, key=_sort_key):
+            tx_hash = (log.get("transactionHash") or "").strip()
+            if not tx_hash:
+                continue
+
+            log_index_hex = log.get("logIndex", "0x0")
+            eid = _event_id(kind, tx_hash, log_index_hex)
+            if eid in seen_set:
+                continue
+
+            topics = log.get("topics") or []
+            if not isinstance(topics, list) or len(topics) < 3:
+                continue
+
+            # topics[1] is "from" for ERC20 Transfer
+            from_addr = _topic_to_addr(topics[1])
+
+            try:
+                value_wei = int(log.get("data", "0x0"), 16)
+            except Exception:
+                continue
+
+            amount = value_wei / (10 ** TUSD_DECIMALS)
+
+            try:
+                if kind == "stake":
+                    await _post_stake_event(app, tx_hash, amount, from_addr)
+                elif kind == "burn":
+                    await _post_burn_event(app, tx_hash, amount, from_addr)
+                else:
+                    buyback = _buyback_from_receipt(tx_hash, _rpc_get_receipt(tx_hash) or {})
+                    if not buyback:
+                        continue
+                    await _post_buyback_event(app, tx_hash, float(buyback["amount"]))
+            except Exception as e:
+                print(f"[watcher] post failed kind={kind} tx={tx_hash} logIndex={log_index_hex} err={e}")
+                continue
+
+            seen_set.add(eid)
+
+    while True:
+        try:
+            # NOTE: do not hold WATCH_LOCK during RPC calls (can block /scan)
+            latest = _rpc_latest_block()
+            if latest is None:
+                await asyncio.sleep(WATCH_POLL_SEC)
+                continue
+
+            safe_latest = max(latest - confirmations, 0)
+
+            # If chain is not ahead enough, just wait
+            if safe_latest <= 0:
+                await asyncio.sleep(WATCH_POLL_SEC)
+                continue
+
+            # Rescan a small overlap window to ensure no misses
+            stake_from = max(stake_last_block - overlap_blocks, 0)
+            burn_from = max(burn_last_block - overlap_blocks, 0)
+            buyback_from = max(buyback_last_block - overlap_blocks, 0)
+
+            # -------------------------
+            # Stake transfers (to staking contract)
+            # -------------------------
+            b = stake_from
+            while b <= safe_latest:
+                end_b = min(b + RPC_LOG_CHUNK - 1, safe_latest)
+                logs = _rpc_get_logs(b, end_b, stake_to_topic)
+                if logs:
+                    await _handle_logs("stake", logs)
+                b = end_b + 1
+
+            # Advance cursor to safe_latest (we rely on overlap + dedupe for safety)
+            stake_last_block = safe_latest
+
+            # -------------------------
+            # Burn transfers (to dead)
+            # -------------------------
+            b = burn_from
+            while b <= safe_latest:
+                end_b = min(b + RPC_LOG_CHUNK - 1, safe_latest)
+                logs = _rpc_get_logs(b, end_b, burn_to_topic)
+                if logs:
+                    await _handle_logs("burn", logs)
+                b = end_b + 1
+
+            burn_last_block = safe_latest
+
+            # -------------------------
+            # Buyback transfers (₸USD transferred into buyback contract through buyback())
+            # -------------------------
+            b = buyback_from
+            while b <= safe_latest:
+                end_b = min(b + RPC_LOG_CHUNK - 1, safe_latest)
+                logs = _rpc_get_logs(b, end_b, buyback_to_topic)
+                if logs:
+                    await _handle_logs("buyback", logs)
+                b = end_b + 1
+
+            buyback_last_block = safe_latest
+
+            # Persist state
+            # Keep only the newest max_seen entries
+            seen_list = list(seen_set)
+            if len(seen_list) > max_seen:
+                seen_list = seen_list[-max_seen:]
+                seen_set = set(seen_list)
+
+            state["stake_last_block"] = stake_last_block
+            state["burn_last_block"] = burn_last_block
+            state["buyback_last_block"] = buyback_last_block
+            state["seen_event_ids"] = seen_list
+            _write_watch_state(state)
+
+        except Exception as e:
+            print("Watcher tick failed:", e)
 
         await asyncio.sleep(WATCH_POLL_SEC)
 
 
-async def post_init(app) -> None:
+
+# ==== Admin command: manual rescan ====
+
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not msg or not chat or not user:
+        return
+
+    # Private + admin only
+    if chat.type != "private" or user.id != ADMIN_ID:
+        return
+
+    confirmations = int(os.environ.get("WATCH_CONFIRMATIONS", "2"))
+    max_seen = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
+
+    stake_to_topic = _topic_address(STAKING_CONTRACT_ADDRESS)
+    burn_to_topic = _topic_address(BURN_ADDRESS)
+
+    def _parse_blocks_csv(s: str) -> list[int]:
+        parts = [p.strip() for p in (s or "").split(",") if p.strip()]
+        out: list[int] = []
+        for p in parts:
+            try:
+                out.append(int(p))
+            except Exception:
+                continue
+        # Unique, keep order
+        seen_local = set()
+        uniq: list[int] = []
+        for b in out:
+            if b in seen_local:
+                continue
+            seen_local.add(b)
+            uniq.append(b)
+        return uniq
+
+    # Mode: /scan <tx_hash>  -> detect buy/stake/burn for a single transaction and DM you the alert
+    if len(context.args) == 1:
+        tx_hash = (context.args[0] or "").strip()
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+            await msg.reply_text("Scanning tx hash...")
+
+            receipt = _rpc_get_receipt(tx_hash)
+            if not receipt:
+                await msg.reply_text("Transaction not found (no receipt).")
+                return
+
+            # 1) Try BUYBACK first
+            buyback = None
+            try:
+                buyback = _buyback_from_receipt(tx_hash, receipt)
+            except Exception:
+                buyback = None
+
+            if buyback:
+                caption = _build_buyback_caption(tx_hash, float(buyback["amount"]))
+                await _send_event_media(context.application, ADMIN_ID, caption, media_path=BUYBACK_MEDIA_PATH)
+                await msg.reply_text("Buyback alert sent in DM.")
+                return
+
+            # 2) Try generic BUY
+            buy = None
+            try:
+                buy = _buy_from_receipt_simple(tx_hash, receipt)
+            except Exception:
+                buy = None
+
+            if buy:
+                caption = _build_buy_caption(tx_hash, float(buy["amount"]), str(buy["buyer"]))
+                await context.application.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                await msg.reply_text("Buy alert sent in DM.")
+                return
+
+            # 3) Try stake/burn (based on Transfer logs)
+            detected: list[str] = []
+            try:
+                for lg in (receipt.get("logs") or []):
+                    if not isinstance(lg, dict):
+                        continue
+                    classified = _classify_transfer_log_kind(lg)
+                    if not classified:
+                        continue
+                    kind, from_addr, amount_float = classified
+                    if kind == "stake":
+                        caption = _build_stake_caption(tx_hash, float(amount_float), str(from_addr))
+                        photo = MEME_BYTES.get("event_staked")
+
+                        lock_until = _stake_lock_until_from_tx_hash(tx_hash)
+                        if lock_until == "January 1, 2030":
+                            photo = MEME_BYTES.get("event_staked_pool5", photo)
+                    else:
+                        caption = _build_burn_caption(tx_hash, float(amount_float), str(from_addr))
+                        photo = MEME_BYTES.get("event_burned")
+
+                    # For /scan we DM the same alert format, including the event image when available.
+                    await _send_event_media(context.application, ADMIN_ID, caption, photo_bytes=photo)
+                    detected.append(kind)
+            except Exception:
+                detected = []
+
+            if detected:
+                kinds = ", ".join(sorted(set(detected)))
+                await msg.reply_text(f"{kinds.capitalize()} alert sent in DM.")
+            else:
+                await msg.reply_text("That tx is not detected as a buy, stake, or burn (no alert sent).")
+            return
+
+    # Modes:
+    #   /scan            -> last 2000 blocks
+    #   /scan 4000       -> last N blocks
+    #   /scan b 42523377 -> scan specific block
+    #   /scan b 1,2,3    -> scan specific blocks (csv)
+    mode = (context.args[0].lower() if context.args else "")
+    is_block_mode = (mode == "b")
+
+    # Read state under lock, but do not hold lock during RPC calls
+    async with WATCH_LOCK:
+        state = _read_watch_state()
+        seen_list = state.get("seen_event_ids") or []
+        if not isinstance(seen_list, list):
+            seen_list = []
+        seen_set = set(x for x in seen_list if isinstance(x, str))
+
+    latest = _rpc_latest_block()
+    if latest is None:
+        await msg.reply_text("RPC error: could not fetch latest block.")
+        return
+
+    safe_latest = max(latest - confirmations, 0)
+
+    posted_stake = 0
+    posted_burn = 0
+
+    # -------------------------
+    # Block mode: scan exact blocks
+    # -------------------------
+    if is_block_mode:
+        if len(context.args) < 2:
+            await msg.reply_text("Usage: /scan b <block> or /scan b <block1,block2,...>")
+            return
+
+        blocks_str = " ".join(context.args[1:]).replace(" ", "")
+        blocks = _parse_blocks_csv(blocks_str)   
+        if not blocks:
+            await msg.reply_text("No valid blocks provided.")
+            return
+
+        blocks_safe = [b for b in blocks if 0 <= b <= safe_latest]
+        if not blocks_safe:
+            await msg.reply_text("Blocks are not confirmed yet.")
+            return
+
+        for blk in blocks_safe:
+            logs = _rpc_get_logs(blk, blk, stake_to_topic)
+            if logs:
+                _mb, _mi, posted = await _process_transfer_logs_dedup_cursor(
+                    app=context.application,
+                    kind="stake",
+                    logs=logs,
+                    last_block=0,
+                    last_log_index=-1,
+                    seen_set=seen_set,
+                    state=state,
+                    max_seen=max_seen,
+                )
+                posted_stake += posted
+
+            logs = _rpc_get_logs(blk, blk, burn_to_topic)
+            if logs:
+                _mb, _mi, posted = await _process_transfer_logs_dedup_cursor(
+                    app=context.application,
+                    kind="burn",
+                    logs=logs,
+                    last_block=0,
+                    last_log_index=-1,
+                    seen_set=seen_set,
+                    state=state,
+                    max_seen=max_seen,
+                )
+                posted_burn += posted
+
+        # Persist state
+        seen_after = state.get("seen_event_ids") or []
+        if not isinstance(seen_after, list):
+            seen_after = []
+        if len(seen_after) > max_seen:
+            state["seen_event_ids"] = seen_after[-max_seen:]
+
+        # Do not move cursors backwards
+        state["stake_last_block"] = max(int(state.get("stake_last_block", 0) or 0), max(blocks_safe))
+        state["burn_last_block"] = max(int(state.get("burn_last_block", 0) or 0), max(blocks_safe))
+
+        async with WATCH_LOCK:
+            _write_watch_state(state)
+
+        await msg.reply_text(
+            "Scan complete.\n"
+            f"Blocks: {', '.join(str(b) for b in blocks_safe)}\n"
+            f"Posted stake events: {posted_stake}\n"
+            f"Posted burn events: {posted_burn}"
+        )
+        return
+
+    # -------------------------
+    # Range mode: scan last N blocks
+    # -------------------------
+    n = 2000
+    if context.args:
+        try:
+            n = int(context.args[0])
+        except Exception:
+            n = 2000
+
+    n = max(1, min(n, 50_000))
+
+    from_block = max(safe_latest - n + 1, 0)
+    to_block = safe_latest
+
+    b = from_block
+    while b <= to_block:
+        end_b = min(b + RPC_LOG_CHUNK - 1, to_block)
+        logs = _rpc_get_logs(b, end_b, stake_to_topic)
+        if logs:
+            _mb, _mi, posted = await _process_transfer_logs_dedup_cursor(
+                app=context.application,
+                kind="stake",
+                logs=logs,
+                last_block=0,
+                last_log_index=-1,
+                seen_set=seen_set,
+                state=state,
+                max_seen=max_seen,
+            )
+            posted_stake += posted
+        b = end_b + 1
+
+    b = from_block
+    while b <= to_block:
+        end_b = min(b + RPC_LOG_CHUNK - 1, to_block)
+        logs = _rpc_get_logs(b, end_b, burn_to_topic)
+        if logs:
+            _mb, _mi, posted = await _process_transfer_logs_dedup_cursor(
+                app=context.application,
+                kind="burn",
+                logs=logs,
+                last_block=0,
+                last_log_index=-1,
+                seen_set=seen_set,
+                state=state,
+                max_seen=max_seen,
+            )
+            posted_burn += posted
+        b = end_b + 1
+
+    state["stake_last_block"] = max(int(state.get("stake_last_block", 0) or 0), to_block)
+    state["burn_last_block"] = max(int(state.get("burn_last_block", 0) or 0), to_block)
+
+    seen_after = state.get("seen_event_ids") or []
+    if not isinstance(seen_after, list):
+        seen_after = []
+    if len(seen_after) > max_seen:
+        state["seen_event_ids"] = seen_after[-max_seen:]
+
+    async with WATCH_LOCK:
+        _write_watch_state(state)
+
+    await msg.reply_text(
+        "Scan complete.\n"
+        f"Range: {from_block} to {to_block}\n"
+        f"Posted stake events: {posted_stake}\n"
+        f"Posted burn events: {posted_burn}"
+    )
+
+
+async def parse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not msg or not chat or not user:
+        return
+
+    # Private + admin only
+    if chat.type != "private" or user.id != ADMIN_ID:
+        return
+
+    # Accept text either as arguments, or as a reply to another message
+    text = ""
+    if context.args:
+        text = " ".join(context.args).strip()
+    elif msg.reply_to_message and (msg.reply_to_message.text or msg.reply_to_message.caption):
+        text = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+    else:
+        await msg.reply_text("Reply to a message that contains the BaseScan text, or pass the text after /parse.")
+        return
+
+    # Normalize whitespace
+    t = "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
+
+    # Tx hash
+    tx_hash = ""
+    m = re.search(r"(0x[a-fA-F0-9]{64})", t)
+    if m:
+        tx_hash = m.group(1).lower()
+
+    # Block
+    block = None
+    m = re.search(r"\bBlock:\s*([0-9]{1,12})\b", t, flags=re.IGNORECASE)
+    if m:
+        try:
+            block = int(m.group(1))
+        except Exception:
+            block = None
+
+    # Kind
+    kind = ""
+    if re.search(r"\bStaking\b", t, flags=re.IGNORECASE) or re.search(re.escape(STAKING_CONTRACT_ADDRESS), t, flags=re.IGNORECASE):
+        kind = "stake"
+    if re.search(r"\bdEaD\b", t, flags=re.IGNORECASE) or re.search(re.escape(BURN_ADDRESS), t, flags=re.IGNORECASE):
+        # If both appear, prefer burn
+        kind = "burn" if kind != "stake" else "burn"
+
+    if not kind:
+        await msg.reply_text("Could not detect if this is stake or burn.")
+        return
+
+    # Amount: prefer "For 1,000,000" style
+    amount = None
+    m = re.search(r"\bFor\s*([0-9][0-9,\.]*)\b", t, flags=re.IGNORECASE)
+    if m:
+        raw = m.group(1).replace(",", "")
+        try:
+            amount = float(raw)
+        except Exception:
+            amount = None
+
+    # Fallback: "Transfer 1.00 M"
+    if amount is None:
+        m = re.search(r"\bTransfer\s*([0-9][0-9,\.]*)\s*([kKmMbB])?\b", t, flags=re.IGNORECASE)
+        if m:
+            num = m.group(1).replace(",", "")
+            suf = (m.group(2) or "").lower()
+            mult = 1.0
+            if suf == "k":
+                mult = 1e3
+            elif suf == "m":
+                mult = 1e6
+            elif suf == "b":
+                mult = 1e9
+            try:
+                amount = float(num) * mult
+            except Exception:
+                amount = None
+
+    if amount is None:
+        await msg.reply_text("Could not parse amount.")
+        return
+
+    # From address: try to find a 0x address after "From:" line
+    from_addr = ""
+    m = re.search(r"\bFrom:\s*\n?([^\n]+)", t, flags=re.IGNORECASE)
+    if m:
+        line = m.group(1)
+        m2 = re.search(r"(0x[a-fA-F0-9]{40})", line)
+        if m2:
+            from_addr = m2.group(1)
+    if not from_addr:
+        # fallback: first address in text that is 40 chars
+        m = re.search(r"(0x[a-fA-F0-9]{40})", t)
+        if m:
+            from_addr = m.group(1)
+
+    if not tx_hash:
+        await msg.reply_text("Could not find tx hash.")
+        return
+
+    # Dedup in watch state
+    eid = f"manual:{kind}:{tx_hash}"
+    async with WATCH_LOCK:
+        state = _read_watch_state()
+        seen = state.get("seen_event_ids") or []
+        if not isinstance(seen, list):
+            seen = []
+        if eid in set(x for x in seen if isinstance(x, str)):
+            await msg.reply_text("Already recorded.")
+            return
+
+        # Append to seen list
+        seen.append(eid)
+        max_seen = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
+        if len(seen) > max_seen:
+            seen = seen[-max_seen:]
+        state["seen_event_ids"] = seen
+
+        # Store manual events for audit
+        manual = state.get("manual_events")
+        if not isinstance(manual, list):
+            manual = []
+        manual.append({
+            "kind": kind,
+            "tx_hash": tx_hash,
+            "block": block,
+            "amount": amount,
+            "from": from_addr,
+            "ts": utc_now_iso(),
+        })
+        if len(manual) > 2000:
+            manual = manual[-2000:]
+        state["manual_events"] = manual
+
+        _write_watch_state(state)
+
+    # Post using existing formatters
     try:
-        if ADMIN_ID:
-            mode = "test mode" if ALLOWED_CHAT_ID == 0 else "group mode"
-            await app.bot.send_message(chat_id=ADMIN_ID, text=f"CLAWD bot started ({mode}). Use /help")
-    except Exception:
-        pass
+        if kind == "stake":
+            await _post_stake_event(context.application, tx_hash, amount, from_addr)
+        else:
+            await _post_burn_event(context.application, tx_hash, amount, from_addr)
+    except Exception as e:
+        await msg.reply_text(f"Parsed but failed to post: {e}")
+        return
 
-    _track_task("monitor", asyncio.create_task(monitor(app)))
+    await msg.reply_text(
+        "Parsed and posted.\n"
+        f"Kind: {kind}\n"
+        f"Amount: {_fmt_tusd(amount)}\n"
+        f"Tx: {tx_hash}\n"
+        f"Block: {block if block is not None else 'unknown'}"
+    )
+# ==== Admin helpers to download/reset watch_state.json ====
 
 
-# =========================
-# Main
-# =========================
+async def watchstate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.message
 
-def main() -> None:
-    _ensure_data_dir()
+    if not chat or not user or not msg:
+        return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    if chat.type != "private" or user.id != ADMIN_ID:
+        return
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("setmin", cmd_setmin))
-    app.add_handler(CommandHandler("setemoji", cmd_setemoji))
-    app.add_handler(CommandHandler("alerts", cmd_alerts))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("burned", cmd_burned))
+    path = WATCH_STATE_PATH
+    if not os.path.exists(path):
+        await msg.reply_text("watch_state.json not found.")
+        return
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        with open(path, "rb") as f:
+            await msg.reply_document(
+                document=f,
+                filename="watch_state.json",
+                caption="watch_state.json"
+            )
+    except Exception as e:
+        await msg.reply_text(f"Failed to send file: {e}")
+
+
+async def resetwatchstate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.message
+
+    if not chat or not user or not msg:
+        return
+
+    if chat.type != "private" or user.id != ADMIN_ID:
+        return
+
+    try:
+        _write_watch_state({})
+        await msg.reply_text("✅ watch_state.json reset. Next events will be detected fresh.")
+    except Exception as e:
+        await msg.reply_text(f"Failed to reset watch_state.json: {e}")
+
+# ==== MAIN ====
+
+async def on_startup(application):
+    global WATCHER_STARTED
+
+    # Startup ping
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text="⚡ Bot arrancado correctamente"
+        )
+    except Exception as e:
+        print("Startup message failed:", e)
+
+    # Start onchain watchers only once
+    try:
+        if not WATCHER_STARTED:
+            WATCHER_STARTED = True
+            loop = asyncio.get_running_loop()
+            loop.create_task(monitor_stake_and_burn(application))
+            print("✅ Watcher started")
+        else:
+            print("⚠️ Watcher already running, skipping")
+    except Exception as e:
+        print("Watcher task failed:", e)
+
+
+
+def main():
+    ensure_data_dir()
+    preload_memes()
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
+
+    # 🚫 GLOBAL COMMAND GUARD
+    app.add_handler(
+        MessageHandler(filters.COMMAND, global_command_guard, block=False),
+        group=0
+    )
+
+    # === SUPPLY COMMANDS ===
+    app.add_handler(CommandHandler("stats", stats), group=1)
+    app.add_handler(CommandHandler("circsupply", circsupply), group=1)
+
+    # === DEBT / INFLATION COMMANDS ===
+    app.add_handler(
+        CommandHandler(["debt", "inflation"], debt_or_inflation_command),
+        group=1
+    )
+
+    # === MONEY PRINTER ===
+    app.add_handler(CommandHandler("printer", printer_command), group=1)
+
+    # === RESET / RESTART ===
+    app.add_handler(
+        CommandHandler("reset", reset_debt_cycle, filters=filters.ChatType.PRIVATE),
+        group=1
+    )
+
+    app.add_handler(
+        CommandHandler("restart", restart, filters=filters.ChatType.PRIVATE),
+        group=1
+    )
+
+    app.add_handler(
+        CommandHandler("scan", scan, filters=filters.ChatType.PRIVATE),
+        group=1
+    )
+
+    app.add_handler(CommandHandler("parse", parse, filters=filters.ChatType.PRIVATE), group=1)
+    # === WATCH STATE ADMIN COMMANDS ===
+    app.add_handler(
+        CommandHandler("watchstate", watchstate, filters=filters.ChatType.PRIVATE),
+        group=1
+    )
+
+    app.add_handler(
+        CommandHandler("resetwatchstate", resetwatchstate, filters=filters.ChatType.PRIVATE),
+        group=1
+    )
+
+    # === YEAR REPLY HANDLER ===
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.REPLY, year_reply_handler),
+        group=2
+    )
+
+    app.run_polling()
 
 
 if __name__ == "__main__":
