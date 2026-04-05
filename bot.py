@@ -45,7 +45,7 @@ if not ANKR_MULTICHAIN_RPC_URL:
 if not ANKR_MULTICHAIN_RPC_URL and "rpc.ankr.com/base/" in (BASE_RPC_URL or ""):
     ANKR_MULTICHAIN_RPC_URL = BASE_RPC_URL.replace("rpc.ankr.com/base/", "rpc.ankr.com/multichain/")
 
-WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "180"))
+WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "300"))
 # Safety clamp to avoid excessive RPC usage
 if WATCH_POLL_SEC < 10:
     WATCH_POLL_SEC = 10
@@ -410,23 +410,69 @@ def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str) -> str:
 
 def _rpc(method: str, params: List[Any]) -> Any:
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(BASE_RPC_URL, json=payload, timeout=12)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(str(j["error"]))
-    return j["result"]
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(BASE_RPC_URL, json=payload, timeout=15)
+            r.raise_for_status()
+            j = r.json()
+            if "error" in j:
+                raise RuntimeError(str(j["error"]))
+            return j["result"]
+        except Exception as e:
+            last_err = e
+            time.sleep(0.4 * (attempt + 1))
+    raise last_err if last_err else RuntimeError(f"_rpc failed: {method}")
+
+
+def _rpc_batch(calls: List[Tuple[str, List[Any]]]) -> List[Any]:
+    """JSON-RPC batch: send multiple (method, params) in one HTTP request.
+    Returns list of results in same order. Falls back to individual calls on failure."""
+    if not calls:
+        return []
+    payloads = [
+        {"jsonrpc": "2.0", "id": idx, "method": m, "params": p}
+        for idx, (m, p) in enumerate(calls)
+    ]
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.post(BASE_RPC_URL, json=payloads, timeout=20)
+            r.raise_for_status()
+            raw = r.json()
+            if not isinstance(raw, list):
+                raise RuntimeError("batch response is not a list")
+            by_id = {}
+            for item in raw:
+                if isinstance(item, dict):
+                    by_id[item.get("id")] = item.get("result")
+            return [by_id.get(idx) for idx in range(len(calls))]
+        except Exception as e:
+            last_err = e
+            time.sleep(0.4 * (attempt + 1))
+    try:
+        print(f"[rpc_batch] failed, falling back err={last_err}")
+    except Exception:
+        pass
+    return [_rpc(m, p) for m, p in calls]
 
 
 def _get_code(addr: str, block_tag: str = "latest") -> str:
     return _rpc("eth_getCode", [addr, block_tag])
 
 
+_IS_CONTRACT_CACHE: Dict[str, bool] = {}
+
 def _is_contract(addr: str, block_number: Optional[int] = None) -> bool:
+    key = _norm(addr)
+    if key in _IS_CONTRACT_CACHE:
+        return _IS_CONTRACT_CACHE[key]
     try:
         tag = hex(int(block_number)) if block_number is not None else "latest"
         code = _get_code(addr, tag)
-        return isinstance(code, str) and code not in ("0x", "0x0", "")
+        result = isinstance(code, str) and code not in ("0x", "0x0", "")
+        _IS_CONTRACT_CACHE[key] = result
+        return result
     except Exception:
         # If in doubt, do not classify as contract here
         return False
@@ -572,12 +618,23 @@ def _token_price_usd_and_fdv(token_addr: str) -> Tuple[Optional[float], Optional
 
 
 
+_BLOCK_TS_CACHE: Dict[int, int] = {}
+
 def _get_block_timestamp(block_number: int) -> Optional[int]:
+    if block_number in _BLOCK_TS_CACHE:
+        return _BLOCK_TS_CACHE[block_number]
     try:
         blk = _rpc("eth_getBlockByNumber", [hex(block_number), False])
         ts_hex = blk.get("timestamp")
         if isinstance(ts_hex, str) and ts_hex.startswith("0x"):
-            return int(ts_hex, 16)
+            ts = int(ts_hex, 16)
+            _BLOCK_TS_CACHE[block_number] = ts
+            # Prevent unbounded growth: keep last 2000 entries
+            if len(_BLOCK_TS_CACHE) > 2000:
+                oldest = sorted(_BLOCK_TS_CACHE)[:500]
+                for k in oldest:
+                    _BLOCK_TS_CACHE.pop(k, None)
+            return ts
     except Exception:
         return None
     return None
@@ -1052,11 +1109,14 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
             payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
             if payer:
                 # If tx.from is an EOA, require payer == tx.from (prevents sells tagged as buys)
+                # UNLESS payer is also an EOA with significant outflow (aggregator/router pattern)
                 # If tx.from is a contract (relayer/router), allow payer != tx.from but require payer to be an EOA
                 if tx_from:
                     if not _is_contract(tx_from, block_number):
                         if _norm(payer) != _norm(tx_from):
-                            return None
+                            # Allow if payer is an EOA (aggregator path where user funds pass through intermediary)
+                            if _is_contract(payer, block_number):
+                                return None
                     else:
                         # Relayed transaction: payer must not be a contract
                         if _is_contract(payer, block_number):
@@ -1071,11 +1131,13 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
             payer = payer_weth
 
             # If tx.from is an EOA, require payer == tx.from (prevents sells tagged as buys)
+            # UNLESS payer is also an EOA (aggregator/router pattern)
             # If tx.from is a contract (relayer/router), allow payer != tx.from but require payer to be an EOA
             if tx_from:
                 if not _is_contract(tx_from, block_number):
                     if _norm(payer) != _norm(tx_from):
-                        return None
+                        if _is_contract(payer, block_number):
+                            return None
                 else:
                     # Relayed transaction: payer must not be a contract
                     if _is_contract(payer, block_number):
@@ -1092,13 +1154,14 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
             return None
 
     total_usd = spent_usd
+    paid_with_weth = (eth_spent_total > 0 and not paid_with_eth)
 
     # Coherence filter to kill false positives.
-    # Skip for native-ETH buys: token price estimates can drift and should not block valid buys.
-    if (not paid_with_eth) and usd_est > 0 and spent_usd > 0:
-        if spent_usd < usd_est * 0.20:
+    # Skip for native-ETH and WETH buys: token price estimates can drift and should not block valid buys.
+    if (not paid_with_eth) and (not paid_with_weth) and usd_est > 0 and spent_usd > 0:
+        if spent_usd < usd_est * 0.10:
             return None
-        if spent_usd > usd_est * 5.0:
+        if spent_usd > usd_est * 8.0:
             return None
 
     return {
@@ -1749,18 +1812,8 @@ _SEL_DECIMALS = "0x313ce567"
 _SEL_LATEST_ROUND = "0xfeaf968c"
 
 def _rpc_eth_call(to_addr: str, data_hex: str) -> str:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": [{"to": to_addr, "data": data_hex}, "latest"],
-    }
-    r = requests.post(BASE_RPC_URL, json=payload, timeout=10)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(j["error"])
-    return j["result"]
+    """Thin wrapper – delegates to _rpc (which now has retries)."""
+    return _rpc("eth_call", [{"to": to_addr, "data": data_hex}, "latest"])
 
 def _abi_int256(word_hex: str) -> int:
     # word_hex is a 32 byte hex string like "0x" + 64 hex chars
@@ -1769,14 +1822,18 @@ def _abi_int256(word_hex: str) -> int:
         x -= 1 << 256
     return x
 
+_CL_PRICE_NOW_DECIMALS: Optional[int] = None
+
 def _get_eth_price_now() -> float:
     """
     Reads ETH/USD from Chainlink on Base via your Ankr Base RPC.
-    No Dexscreener dependency.
+    No Dexscreener dependency.  Caches Chainlink decimals() after first call.
     """
+    global _CL_PRICE_NOW_DECIMALS
     try:
-        dec_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_DECIMALS)
-        decimals = int(dec_raw, 16)
+        if _CL_PRICE_NOW_DECIMALS is None:
+            dec_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_DECIMALS)
+            _CL_PRICE_NOW_DECIMALS = int(dec_raw, 16)
 
         lr_raw = _rpc_eth_call(CHAINLINK_ETH_USD_FEED, _SEL_LATEST_ROUND)
         if not lr_raw or lr_raw == "0x":
@@ -1790,7 +1847,7 @@ def _get_eth_price_now() -> float:
         if answer <= 0:
             return 0.0
 
-        return float(answer) / (10 ** decimals)
+        return float(answer) / (10 ** int(_CL_PRICE_NOW_DECIMALS))
     except Exception:
         return 0.0
 
@@ -1896,6 +1953,36 @@ def _basescan_token_holder_count(token_addr: str) -> Optional[int]:
 
 
 
+_STATS_CACHE: Dict[str, Any] = {"ts": 0, "data": None}
+_STATS_CACHE_TTL = 60  # seconds
+
+def _fetch_stats_balances_batched() -> Dict[str, int]:
+    """Fetch all 6 balanceOf calls for /stats in a single RPC batch."""
+    clawdviction_wallet = "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
+    clawdlabs_wallet = "0x85Af18A392E564F68897A0518C191D0831e40a46"
+
+    selector = "0x70a08231"
+    def _bal_data(holder: str) -> str:
+        return selector + holder.lower().replace("0x", "").rjust(64, "0")
+
+    calls = [
+        ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(CLAWD_WALLET)}, "latest"]),
+        ("eth_call", [{"to": WETH_ADDRESS, "data": _bal_data(CLAWD_WALLET)}, "latest"]),
+        ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(BURN_ADDRESS)}, "latest"]),
+        ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(INCINERATOR_ADDRESS)}, "latest"]),
+        ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(clawdviction_wallet)}, "latest"]),
+        ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(clawdlabs_wallet)}, "latest"]),
+    ]
+
+    results = _rpc_batch(calls)
+    keys = ["clawd", "weth", "burned", "incinerator", "clawdviction", "clawdlabs"]
+    out: Dict[str, int] = {}
+    for i, k in enumerate(keys):
+        raw = results[i] if i < len(results) else "0x0"
+        out[k] = int(raw or "0x0", 16)
+    return out
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -1928,16 +2015,25 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clawdviction_wallet = "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
     clawdlabs_wallet = "0x85Af18A392E564F68897A0518C191D0831e40a46"
 
-    try:
-        clawd_bal_int = _erc20_balance_of(TOKEN_ADDRESS, CLAWD_WALLET)
-        weth_bal_int = _erc20_balance_of(WETH_ADDRESS, CLAWD_WALLET)
-        burned_bal_int = _erc20_balance_of(TOKEN_ADDRESS, BURN_ADDRESS)
-        incinerator_bal_int = _erc20_balance_of(TOKEN_ADDRESS, INCINERATOR_ADDRESS)
-        clawdviction_bal_int = _erc20_balance_of(TOKEN_ADDRESS, clawdviction_wallet)
-        clawdlabs_bal_int = _erc20_balance_of(TOKEN_ADDRESS, clawdlabs_wallet)
-    except Exception as e:
-        await update.message.reply_text(f"Failed to read balances from RPC: {e}")
-        return
+    # Use cached stats if recent (avoids repeated RPC calls when multiple users hit /stats)
+    now = time.time()
+    if _STATS_CACHE["data"] and (now - _STATS_CACHE["ts"]) < _STATS_CACHE_TTL:
+        bals = _STATS_CACHE["data"]
+    else:
+        try:
+            bals = _fetch_stats_balances_batched()
+            _STATS_CACHE["ts"] = now
+            _STATS_CACHE["data"] = bals
+        except Exception as e:
+            await update.message.reply_text(f"Failed to read balances from RPC: {e}")
+            return
+
+    clawd_bal_int = bals["clawd"]
+    weth_bal_int = bals["weth"]
+    burned_bal_int = bals["burned"]
+    incinerator_bal_int = bals["incinerator"]
+    clawdviction_bal_int = bals["clawdviction"]
+    clawdlabs_bal_int = bals["clawdlabs"]
 
     clawd_amt = _dec(clawd_bal_int, TOKEN_DECIMALS)
     weth_amt = _dec(weth_bal_int, 18)
