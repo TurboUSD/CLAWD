@@ -833,36 +833,6 @@ def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
 
 
 
-def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
-    """
-    Read Chainlink ETH/USD price at a specific block using eth_call with block tag.
-    This avoids any external HTTP price APIs and works on standard (non-archive) RPC
-    as long as the block is still available (recent history).
-    """
-    try:
-        # latestRoundData() selector
-        data = "0x" + "feaf968c"
-        res = _rpc("eth_call", [{
-            "to": CHAINLINK_ETH_USD_FEED,
-            "data": data,
-        }, hex(int(block_number))])
-        if not isinstance(res, str) or not res.startswith("0x"):
-            return None
-        raw = bytes.fromhex(res[2:])
-        if len(raw) < 32 * 5:
-            return None
-        # return values: (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
-        answer_bytes = raw[32:64]
-        answer = int.from_bytes(answer_bytes, byteorder="big", signed=True)
-        if answer <= 0:
-            return None
-        # Chainlink ETH/USD feeds are typically 8 decimals
-        return float(answer) / 1e8
-    except Exception:
-        return None
-
-
-
 # Chainlink ETH/USD feed on Base Mainnet (proxy)
 # Source: https://data.chain.link/feeds/base/base/eth-usd
 CHAINLINK_ETH_USD_FEED_BASE = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
@@ -1277,7 +1247,7 @@ def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[s
     # Fallback: WETH inflow
     if got_usd <= 0 and weth_in > 0 and recv_weth:
         receiver = recv_weth
-        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=allow_live_eth_fallback) or 0.0
+        wp = _weth_price_usd(block_number=block_number, allow_live_fallback=False) or 0.0
         got_usd += _dec(max(0, weth_del.get(receiver, 0)), 18) * wp
 
     # Add ETH received only if tx.to is seller? Hard to do reliably. Skip to avoid false positives.
@@ -2507,9 +2477,20 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
                     seen_burn.add(event_id)
 
         if tx_hash:
+            # Accumulate token transfer amounts for the prefilter estimate.
+            # We parse the Transfer amount directly from ANY CLAWD Transfer log,
+            # not just classified (stake/burn) ones — otherwise buy-only txs get
+            # a zero estimate and are incorrectly prefiltered out.
             try:
-                est = abs(_dec(amount_int, TOKEN_DECIMALS)) if 'amount_int' in locals() else 0
-                tx_value_est[tx_hash] = tx_value_est.get(tx_hash,0)+est
+                _log_addr = _norm(lg.get("address", ""))
+                _log_topics = lg.get("topics") or []
+                if (
+                    _log_addr == _norm(TOKEN_ADDRESS)
+                    and len(_log_topics) >= 3
+                    and _norm(_log_topics[0]) == TRANSFER_TOPIC0
+                ):
+                    _log_amount = int(lg.get("data", "0x0"), 16)
+                    tx_value_est[tx_hash] = tx_value_est.get(tx_hash, 0) + abs(_dec(_log_amount, TOKEN_DECIMALS))
             except Exception:
                 pass
         if tx_hash and tx_hash not in tx_seen_local:
