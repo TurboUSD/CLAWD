@@ -229,6 +229,18 @@ def _save_state(state: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
+def _update_state_fields(mutator) -> Dict[str, Any]:
+    """Load a FRESH copy of state, apply mutator(state), save, and return it.
+
+    Never save a long-held state object directly: writing a stale snapshot
+    silently reverts concurrent changes (e.g. a /setmin issued while a
+    monitor tick is running would get clobbered back to its old value)."""
+    fresh = _load_state()
+    mutator(fresh)
+    _save_state(fresh)
+    return fresh
+
+
 
 # =========================
 # Burned cache (per day)
@@ -1061,10 +1073,12 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
     price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
     if price is not None:
         cache["token_price_usd"] = float(price)
+        # Persist only the price cache on a FRESH state copy (saving the
+        # stale full-state snapshot could clobber a concurrent /setmin).
+        _px = float(price)
+        _update_state_fields(lambda s: s["cache"].__setitem__("token_price_usd", _px))
     else:
         price = cache.get("token_price_usd")
-
-    _save_state(state)
 
     usd_est = (float(price) if price is not None else 0.0) * float(tokens_bought)
 
@@ -1251,10 +1265,12 @@ def _sell_from_receipt(tx_hash: str, receipt: Dict[str, Any]) -> Optional[Dict[s
     price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
     if price is not None:
         cache["token_price_usd"] = float(price)
+        # Persist only the price cache on a FRESH state copy (saving the
+        # stale full-state snapshot could clobber a concurrent /setmin).
+        _px = float(price)
+        _update_state_fields(lambda s: s["cache"].__setitem__("token_price_usd", _px))
     else:
         price = cache.get("token_price_usd")
-
-    _save_state(state)
 
     usd_est = (float(price) if price is not None else 0.0) * float(tokens_sold)
 
@@ -2453,9 +2469,13 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
     price, _fdv = _token_price_usd_and_fdv(TOKEN_ADDRESS)
     if price is not None:
         state["cache"]["token_price_usd"] = float(price)
+        # Persist only the refreshed price cache on a FRESH state copy.
+        # Saving the tick-local `state` here would clobber concurrent
+        # changes (e.g. /setmin) made since the tick started.
+        _px = float(price)
+        _update_state_fields(lambda s: s["cache"].__setitem__("token_price_usd", _px))
     else:
         price = state.get("cache", {}).get("token_price_usd")
-    _save_state(state)
 
     token_price = float(price) if price is not None else 0.0
 
@@ -2611,11 +2631,15 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
         except Exception:
             continue
 
-    state["watch"]["last_scanned_block"] = end
-    state["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
-    state["watch"]["seen"]["stake"] = _prune_seen(list(seen_stake))
-    state["watch"]["seen"]["burn"] = _prune_seen(list(seen_burn))
-    _save_state(state)
+    # Persist tick results on a FRESH state load. The tick-local `state` was
+    # loaded when the tick started and slow RPC work happened since; saving it
+    # whole would silently revert concurrent changes such as /setmin.
+    def _persist_tick(s: Dict[str, Any]) -> None:
+        s["watch"]["last_scanned_block"] = end
+        s["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
+        s["watch"]["seen"]["stake"] = _prune_seen(list(seen_stake))
+        s["watch"]["seen"]["burn"] = _prune_seen(list(seen_burn))
+    _update_state_fields(_persist_tick)
 
     return outgoing
 
@@ -2656,7 +2680,11 @@ async def monitor(app) -> None:
                     sent_burn.add(uid)
                     state["watch"]["sent_public"]["burn"] = _prune_seen(list(sent_burn))
 
-                _save_state(state)
+                # Persist only the sent_public lists on a FRESH state copy —
+                # this loop holds `state` across awaits, so a full save could
+                # clobber concurrent changes (e.g. /setmin).
+                _sp = {k2: list(v) for k2, v in state["watch"]["sent_public"].items()}
+                _update_state_fields(lambda s, _sp=_sp: s.setdefault("watch", {}).__setitem__("sent_public", _sp))
 
                 # Optional: DM alert to admin (toggle with /alerts on|off)
                 try:
@@ -2688,7 +2716,8 @@ async def monitor(app) -> None:
                             state["watch"]["sent_dm"]["burn"] = _prune_seen(list(sent_dm_burn))
 
                     if not already:
-                        _save_state(state)
+                        _sd = {k2: list(v) for k2, v in state["watch"]["sent_dm"].items()}
+                        _update_state_fields(lambda s, _sd=_sd: s.setdefault("watch", {}).__setitem__("sent_dm", _sd))
                         await _send_photo_or_text(app, ADMIN_ID, kind, caption)
         except Exception:
             pass
